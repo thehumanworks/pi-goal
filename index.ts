@@ -5,6 +5,7 @@ import type {
   BeforeAgentStartEventResult,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum, Type } from "@earendil-works/pi-ai";
+import fs from "node:fs";
 import path from "node:path";
 import {
   createGoalManager,
@@ -43,6 +44,63 @@ const GOAL_STATUS_COLOR = "\x1b[95m";
 const RESET_FOREGROUND_COLOR = "\x1b[39m";
 
 const GOAL_TASK_ACTIONS = ["list", "add", "check", "uncheck"] as const;
+
+// Gate-pass circuit breaker. The completion gate re-fires after every
+// agent_end on a still-active goal; without a guard, an agent that keeps
+// stopping (or keeps re-calling goal_complete against an always-red exec gate)
+// loops forever and burns tokens. We count *consecutive* gate passes and reset
+// the counter on genuine code progress (an edit/write tool running), so
+// productive multi-turn work is never penalised — only stuck/looping turns
+// accumulate. At GOAL_GATE_ESCALATE_AT we raise the thinking level once; at the
+// max (configurable via --goal-max-gate-passes) we abort to stop the loop.
+const GOAL_GATE_ESCALATE_AT = 3;
+const GOAL_GATE_DEFAULT_MAX_PASSES = 6;
+const GOAL_PROGRESS_TOOLS = new Set(["edit", "write"]);
+const GOAL_MAX_GATE_PASSES_FLAG = "goal-max-gate-passes";
+const GOAL_NO_EXEC_GATE_FLAG = "goal-no-exec-gate";
+
+// Exec-verified completion gate. Before goal_complete is accepted, run the
+// project's own verification commands (tests / typecheck / lint) and refuse
+// completion if any are red — completion becomes machine-checked exit codes,
+// not self-narrated prose (SWE-bench fail-to-pass / Factory exit-code gate).
+const GOAL_EXEC_TIMEOUT_MS = 120_000;
+const GOAL_EXEC_OUTPUT_CAP = 4_000;
+
+const readJsonSafe = (filePath: string): Record<string, unknown> | null => {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+};
+
+// Discover verification commands for the exec gate, in priority order:
+//   1. .pi-goal.json { "validate": ["cmd", ...] } — explicit shell commands.
+//   2. package.json scripts (typecheck, test, lint) — the raw script command
+//      is run directly (pm-agnostic; no `npm run` wrapper guessing).
+// Returns [] when nothing is discoverable; the gate then degrades to a warning.
+const discoverValidationCommands = (cwd: string): string[] => {
+  const config = readJsonSafe(path.join(cwd, ".pi-goal.json"));
+  const declared = config?.validate;
+  if (Array.isArray(declared)) {
+    return declared.filter(
+      (c): c is string => typeof c === "string" && c.trim().length > 0,
+    );
+  }
+
+  const pkg = readJsonSafe(path.join(cwd, "package.json"));
+  const scripts =
+    pkg && typeof pkg.scripts === "object" && pkg.scripts ?
+      (pkg.scripts as Record<string, unknown>)
+    : {};
+  const commands: string[] = [];
+  for (const name of ["typecheck", "test", "lint"]) {
+    const body = scripts[name];
+    if (typeof body === "string" && body.trim().length > 0) commands.push(body);
+  }
+  return commands;
+};
 
 // Structured-evidence schema: each field is required and its description is
 // the actual gate. The LLM API enforces presence of the fields; the field
@@ -96,6 +154,12 @@ export default function(pi: ExtensionAPI) {
   // Set in agent_end, consumed and cleared in the next `context` event.
   // Drives one-shot injection of the gate prose into the upcoming LLM call.
   let pendingGateInjection = false;
+  // Consecutive gate passes since the last genuine code progress. Reset on
+  // setGoal/adoptPersistedGoal and on edit/write tool execution.
+  let gatePassCount = 0;
+  // Validation commands for the exec-verified completion gate, discovered once
+  // lazily (null = not yet probed).
+  let validationCommands: string[] | null = null;
 
   const colorizeGoalStatus = (text: string) =>
     `${GOAL_STATUS_COLOR}${text}${RESET_FOREGROUND_COLOR}`;
@@ -164,6 +228,8 @@ export default function(pi: ExtensionAPI) {
     const nextGoal = await goalManager.createGoal(sessionId, goalText);
     clearGoalContinuationTimer();
     pendingGateInjection = false;
+    gatePassCount = 0;
+    validationCommands = null;
     goal = nextGoal;
     goalSessionId = sessionId;
   };
@@ -173,17 +239,73 @@ export default function(pi: ExtensionAPI) {
   const adoptPersistedGoal = (persistedGoal: GoalJson, sessionId: string) => {
     clearGoalContinuationTimer();
     pendingGateInjection = false;
+    gatePassCount = 0;
+    validationCommands = null;
     goal = persistedGoal;
     goalSessionId = sessionId;
   };
 
-  const sendGoalUserMessage = (goalText: string, isIdle: boolean) => {
-    if (isIdle) {
-      pi.sendUserMessage(goalText);
-      return;
-    }
+  const getMaxGatePasses = () => {
+    const raw = pi.getFlag(GOAL_MAX_GATE_PASSES_FLAG);
+    const parsed = typeof raw === "string" ? parseInt(raw, 10) : NaN;
+    return Number.isFinite(parsed) && parsed > 0 ?
+        parsed
+      : GOAL_GATE_DEFAULT_MAX_PASSES;
+  };
 
-    pi.sendUserMessage(goalText, { deliverAs: "steer" });
+  // Run the discovered verification commands. Returns a blocking report (with
+  // the failing command + truncated output) on the first non-zero exit, or
+  // {blocked:false} when everything passes or no commands are discoverable.
+  type GateResult =
+    | { blocked: false; commandCount: number }
+    | { blocked: true; report: string };
+  const runValidationGate = async (cwd: string): Promise<GateResult> => {
+    if (validationCommands === null)
+      validationCommands = discoverValidationCommands(cwd);
+    if (validationCommands.length === 0)
+      return { blocked: false, commandCount: 0 };
+
+    for (const command of validationCommands) {
+      // Prepend the project's local bin to PATH so package.json scripts and
+      // .pi-goal.json commands can invoke locally-installed tools (jest, tsc,
+      // eslint, vitest, …) the same way `npm run`/`bun run` would. Without
+      // this, `bash -lc jest` fails with "command not found" (a non-zero exit
+      // that would falsely block completion).
+      const result = await pi.exec(
+        "bash",
+        ["-lc", `export PATH="$PWD/node_modules/.bin:$PATH"; ${command}`],
+        { cwd, timeout: GOAL_EXEC_TIMEOUT_MS },
+      );
+      if (result.code !== 0) {
+        const combined = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.trim();
+        const output =
+          combined.length > GOAL_EXEC_OUTPUT_CAP ?
+            combined.slice(-GOAL_EXEC_OUTPUT_CAP)
+          : combined;
+        return {
+          blocked: true,
+          report:
+            `COMPLETION BLOCKED: verification command failed (exit ${result.code}` +
+            `${result.killed ? ", timed out" : ""}):\n$ ${command}\n` +
+            `${output || "(no output)"}\n\n` +
+            `Fix the failure and call goal_complete again. Do not mark the goal ` +
+            `complete while verification is red.`,
+        };
+      }
+    }
+    return { blocked: false, commandCount: validationCommands.length };
+  };
+
+  const sendGoalUserMessage = (goalText: string, isIdle: boolean) => {
+    // Never use a bare plain send (no deliverAs). In headless/print mode
+    // (`pi -p`), ctx.isIdle() can report idle at session_start while a prompt
+    // is already being processed; a plain send then async-rejects with "Agent
+    // is already processing" (the rejection is not synchronously catchable —
+    // see bindCore in pi-coding-agent's loader.js), so the run dies with zero
+    // turns. Always specify a delivery mode: `followUp` triggers a turn when
+    // genuinely idle and safely queues when busy; `steer` redirects a stream
+    // that is actually in progress. This mirrors the agent_end gate's delivery.
+    pi.sendUserMessage(goalText, { deliverAs: isIdle ? "followUp" : "steer" });
   };
 
   const noActiveGoal = () => ({
@@ -200,6 +322,18 @@ export default function(pi: ExtensionAPI) {
     description:
       "define a target goal for the agent to achieve in a continuous loop",
     type: "string",
+  });
+
+  pi.registerFlag(GOAL_MAX_GATE_PASSES_FLAG, {
+    description:
+      "Hard-stop the goal completion gate after this many consecutive stuck passes (default 6).",
+    type: "string",
+  });
+
+  pi.registerFlag(GOAL_NO_EXEC_GATE_FLAG, {
+    description:
+      "Disable the exec-verified completion gate (do not run test/lint/typecheck commands before accepting goal_complete).",
+    type: "boolean",
   });
 
   pi.on("session_start", async (_event, ctx) => {
@@ -276,6 +410,28 @@ export default function(pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       if (!goal) return noActiveGoal();
 
+      // Exec-verified gate: completion is gated on real exit codes, not just
+      // the self-narrated evidence schema. A red check blocks completion and
+      // routes the failing output back so the agent keeps working.
+      let verificationNote = "";
+      if (pi.getFlag(GOAL_NO_EXEC_GATE_FLAG) !== true) {
+        const gate = await runValidationGate(ctx.cwd);
+        if (gate.blocked) {
+          pendingGateInjection = true;
+          return {
+            content: [{ type: "text", text: gate.report }],
+            details: {
+              goal,
+              error: "Completion blocked: verification failed",
+            } as GoalToolDetails,
+          };
+        }
+        verificationNote =
+          gate.commandCount > 0 ?
+            ` Verified by ${gate.commandCount} command(s): all passed.`
+          : " No validation commands discovered (.pi-goal.json or package.json scripts); completion not machine-verified.";
+      }
+
       goal.isActive = false;
       goal.completedAt = now();
       goal.completionSummary = formatGoalCompletionEvidence(params);
@@ -293,7 +449,10 @@ export default function(pi: ExtensionAPI) {
 
       return {
         content: [
-          { type: "text", text: `Goal marked complete: ${params.summary}` },
+          {
+            type: "text",
+            text: `Goal marked complete: ${params.summary}${verificationNote}`,
+          },
         ],
         details: { goal } as GoalToolDetails,
       };
@@ -480,14 +639,63 @@ export default function(pi: ExtensionAPI) {
     } as BeforeAgentStartEventResult;
   });
 
-  pi.on("agent_end", (_event, _ctx) => {
+  pi.on("agent_end", (_event, ctx) => {
     if (!goal?.isActive) return;
 
     clearGoalContinuationTimer();
-    goalContinuationTimer = setTimeout(() => {
+    goalContinuationTimer = setTimeout(async () => {
       goalContinuationTimer = null;
       const activeGoal = goal;
       if (!activeGoal?.isActive) return;
+
+      // Gate-pass circuit breaker. Count this pass; reset happens on genuine
+      // code progress (see the tool_execution_end handler). Escalate the
+      // thinking level once when the agent starts looping, and hard-stop the
+      // gate entirely after the configured maximum to prevent an infinite,
+      // token-burning loop (the prerequisite that makes the exec gate safe).
+      gatePassCount += 1;
+      const maxPasses = getMaxGatePasses();
+
+      if (gatePassCount === GOAL_GATE_ESCALATE_AT && gatePassCount < maxPasses) {
+        try {
+          pi.setThinkingLevel("high");
+        } catch {
+          // Model may not support thinking; escalation is best-effort.
+        }
+      }
+
+      if (gatePassCount >= maxPasses) {
+        activeGoal.isActive = false;
+        activeGoal.completedAt = now();
+        activeGoal.completionSummary =
+          `Goal gate hard-stopped after ${gatePassCount} consecutive passes ` +
+          `without code progress: the agent neither completed the goal nor ` +
+          `made edits between gate passes. Refine the goal or raise ` +
+          `--${GOAL_MAX_GATE_PASSES_FLAG}.`;
+        // Await persistence before aborting: ctx.abort() may tear down the
+        // run, and an unawaited save could be lost, leaving a stale active
+        // goal that wrongly resumes on the next session_start.
+        await saveGoal();
+        clearGoalStatusTimer();
+        setGoalStatus(
+          ctx,
+          colorizeGoalStatus(
+            `Goal gate stopped after ${gatePassCount} passes without progress`,
+          ),
+        );
+        ctx.ui.notify(
+          `Goal gate stopped after ${gatePassCount} passes without progress. ` +
+            `Refine the goal or raise --${GOAL_MAX_GATE_PASSES_FLAG}.`,
+          "warning",
+        );
+        pendingGateInjection = false;
+        try {
+          ctx.abort();
+        } catch {
+          // No active operation to abort; the goal is already inactive.
+        }
+        return;
+      }
 
       // Two-channel delivery, separated for robustness:
       //
@@ -528,6 +736,16 @@ export default function(pi: ExtensionAPI) {
       }
     }, 0);
     goalContinuationTimer.unref?.();
+  });
+
+  // Genuine code progress resets the stuck-counter, so the circuit breaker
+  // only trips on turns that loop without editing (text-only stops or repeated
+  // goal_complete retries that never fix the failing verification).
+  pi.on("tool_execution_end", (event) => {
+    if (!goal?.isActive) return;
+    if (GOAL_PROGRESS_TOOLS.has(event.toolName)) {
+      gatePassCount = 0;
+    }
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {

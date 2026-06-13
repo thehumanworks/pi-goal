@@ -60,6 +60,18 @@ evidence-backed completion.
   `--goal-max-gate-passes` (default 6) it aborts and marks the goal stopped, so
   an always-red exec gate or a text-only loop can't burn tokens forever.
 
+## Scope enforcement (scope variant)
+- **`goal_scope` tool** declares the file scope: `set` with `allow` and/or
+  `deny` glob arrays, `list`, `clear`. Scope is in-memory (session-scoped;
+  re-declare after a reload) and resets on goal replacement.
+- A **`tool_call` hook hard-blocks** `edit`/`write` to out-of-scope paths via
+  `{block, reason}`. deny takes precedence; a non-empty `allow` makes anything
+  outside it out-of-scope. Paths are made cwd-relative and normalized (so `../`
+  traversal can't slip past an allowlist). Reads/searches are never gated.
+- A `<goal_scope>` reminder is injected into context each turn while a scope is
+  set. **Limitation:** bash-based writes (`echo >`, `tee`, `sed -i`) are NOT
+  intercepted — scope is a drift guardrail, not a security sandbox.
+
 ## Loop mechanics (how the goal keeps the agent working)
 1. `before_agent_start` appends the mission prompt to the system prompt.
 2. `context` (fires before each LLM call) injects a `<goal_state>` custom-role

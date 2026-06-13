@@ -30,6 +30,7 @@ const GOALS_DIR = path.join(process.env.HOME!, ".pi", "agent", "goals");
 const GOAL_STATUS_UPDATE_INTERVAL_MS = 1000;
 const GOAL_STATE_CUSTOM_TYPE = "goal-state";
 const GOAL_COMPLETION_GATE_CUSTOM_TYPE = "goal-completion-gate";
+const GOAL_SCOPE_CUSTOM_TYPE = "goal-scope";
 const GOAL_STATUS_KEY = "goal";
 // Brief, neutral text that triggers a follow-up turn after agent_end. The
 // actual completion-gate prose is delivered via the `context` handler as a
@@ -58,6 +59,45 @@ const GOAL_GATE_DEFAULT_MAX_PASSES = 6;
 const GOAL_PROGRESS_TOOLS = new Set(["edit", "write"]);
 const GOAL_MAX_GATE_PASSES_FLAG = "goal-max-gate-passes";
 const GOAL_NO_EXEC_GATE_FLAG = "goal-no-exec-gate";
+
+// Scope enforcement. The most common coding-agent failure is editing files
+// outside the task (scope creep). The agent declares an allow/deny path scope
+// via goal_scope; writes to out-of-scope paths are hard-blocked at the
+// tool_call hook before they run (Spec-Driven Development / Codex boundaries).
+const GOAL_SCOPE_ACTIONS = ["set", "list", "clear"] as const;
+const GOAL_WRITE_TOOLS = new Set(["edit", "write"]);
+
+// Minimal, dependency-free glob → RegExp (supports ** and *). Paths are
+// normalised to forward slashes and stripped of a leading "./" before matching.
+const globToRegExp = (glob: string): RegExp => {
+  const normalized = glob.trim().replace(/^\.\//, "");
+  let out = "";
+  for (let i = 0; i < normalized.length; i++) {
+    const char = normalized[i]!;
+    if (char === "*" && normalized[i + 1] === "*") {
+      if (normalized[i + 2] === "/") {
+        out += "(?:.*/)?";
+        i += 2;
+      } else {
+        out += ".*";
+        i += 1;
+      }
+    } else if (char === "*") {
+      out += "[^/]*";
+    } else {
+      out += char.replace(/[.+^${}()|[\]\\]/, "\\$&");
+    }
+  }
+  return new RegExp("^" + out + "$");
+}
+
+const normalizeScopePath = (filePath: string): string =>
+  filePath.replace(/\\/g, "/").replace(/^\.\//, "");
+
+const pathMatchesAny = (filePath: string, patterns: string[]): boolean => {
+  const normalized = normalizeScopePath(filePath);
+  return patterns.some((pattern) => globToRegExp(pattern).test(normalized));
+};
 
 // Exec-verified completion gate. Before goal_complete is accepted, run the
 // project's own verification commands (tests / typecheck / lint) and refuse
@@ -142,6 +182,22 @@ const GoalTaskParams = Type.Object({
   ),
 });
 
+const GoalScopeParams = Type.Object({
+  action: StringEnum(GOAL_SCOPE_ACTIONS),
+  allow: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "Glob patterns (relative to cwd) for paths the agent MAY modify. When non-empty, writes to paths outside this allowlist are blocked. Used with action 'set'.",
+    }),
+  ),
+  deny: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "Glob patterns for paths the agent must NOT modify; takes precedence over allow. Used with action 'set'.",
+    }),
+  ),
+});
+
 // Re-exported so existing imports of this module keep working.
 export { normalizeGoalText };
 
@@ -160,6 +216,9 @@ export default function(pi: ExtensionAPI) {
   // Validation commands for the exec-verified completion gate, discovered once
   // lazily (null = not yet probed).
   let validationCommands: string[] | null = null;
+  // In-memory scope for the active goal (session-scoped; re-declare after a
+  // reload). allow: paths the agent may modify; deny: paths it must not.
+  let goalScope: { allow: string[]; deny: string[] } = { allow: [], deny: [] };
 
   const colorizeGoalStatus = (text: string) =>
     `${GOAL_STATUS_COLOR}${text}${RESET_FOREGROUND_COLOR}`;
@@ -230,6 +289,7 @@ export default function(pi: ExtensionAPI) {
     pendingGateInjection = false;
     gatePassCount = 0;
     validationCommands = null;
+    goalScope = { allow: [], deny: [] };
     goal = nextGoal;
     goalSessionId = sessionId;
   };
@@ -241,8 +301,41 @@ export default function(pi: ExtensionAPI) {
     pendingGateInjection = false;
     gatePassCount = 0;
     validationCommands = null;
+    goalScope = { allow: [], deny: [] };
     goal = persistedGoal;
     goalSessionId = sessionId;
+  };
+
+  // Evaluate a write target against the active scope. deny takes precedence;
+  // a non-empty allowlist makes anything outside it out-of-scope. The path is
+  // made cwd-relative first, since pi may hand the tools an absolute path while
+  // scope globs are written relative to the project root.
+  const evaluateScope = (
+    rawPath: string,
+    cwd: string,
+  ): { blocked: boolean; reason?: string } => {
+    let filePath = rawPath.replace(/\\/g, "/");
+    const normalizedCwd = cwd.replace(/\\/g, "/").replace(/\/+$/, "");
+    if (normalizedCwd && filePath.startsWith(normalizedCwd + "/")) {
+      filePath = filePath.slice(normalizedCwd.length + 1);
+    }
+    // Collapse "." / ".." segments BEFORE matching, so a traversal like
+    // "src/../../secret.ts" becomes "../secret.ts" and cannot sneak past an
+    // "src/**" allowlist (whose regex `.*` would otherwise span the slashes).
+    filePath = path.posix.normalize(filePath);
+    if (goalScope.deny.length && pathMatchesAny(filePath, goalScope.deny)) {
+      return {
+        blocked: true,
+        reason: `Path "${filePath}" is out of scope for this goal (matches a deny pattern). Do not modify it; if it is genuinely required, update the goal scope with goal_scope first.`,
+      };
+    }
+    if (goalScope.allow.length && !pathMatchesAny(filePath, goalScope.allow)) {
+      return {
+        blocked: true,
+        reason: `Path "${filePath}" is outside the declared in-scope allowlist (${goalScope.allow.join(", ")}). Stay within scope; if this file is genuinely required, extend the scope with goal_scope first.`,
+      };
+    }
+    return { blocked: false };
   };
 
   const getMaxGatePasses = () => {
@@ -590,6 +683,63 @@ export default function(pi: ExtensionAPI) {
     },
   });
 
+  pi.registerTool({
+    name: "goal_scope",
+    label: "Goal Scope",
+    description:
+      "Declare or inspect the file scope for the active goal. Use action 'set' with allow (glob patterns the agent MAY modify) and/or deny (patterns it must NOT modify) to constrain edits; writes to out-of-scope paths are then blocked before they run. 'list' shows the current scope; 'clear' removes all constraints. Declare scope early to prevent scope creep.",
+    parameters: GoalScopeParams,
+    async execute(_toolCallId, params) {
+      if (!goal) return noActiveGoal();
+
+      if (params.action === "clear") {
+        goalScope = { allow: [], deny: [] };
+        return {
+          content: [{ type: "text", text: "Goal scope cleared." }],
+          details: { goal } as GoalToolDetails,
+        };
+      }
+
+      if (params.action === "set") {
+        goalScope = {
+          allow: (params.allow ?? []).filter((p) => p.trim().length > 0),
+          deny: (params.deny ?? []).filter((p) => p.trim().length > 0),
+        };
+      }
+
+      const describe =
+        goalScope.allow.length || goalScope.deny.length ?
+          `allow: [${goalScope.allow.join(", ") || "(any)"}]\ndeny: [${goalScope.deny.join(", ") || "(none)"}]`
+        : "No scope constraints set (all paths writable).";
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              params.action === "set" ?
+                `Goal scope set.\n${describe}`
+              : describe,
+          },
+        ],
+        details: { goal } as GoalToolDetails,
+      };
+    },
+  });
+
+  // Hard-block writes to out-of-scope paths before they execute. Only the
+  // built-in mutating tools (edit/write) are gated; reads/searches are always
+  // allowed. NOTE: this does NOT intercept bash-based writes (echo >, tee,
+  // sed -i, cp, …) — scope is a guardrail against accidental edit/write drift,
+  // not a security sandbox. A determined agent can still mutate via bash.
+  pi.on("tool_call", (event, ctx) => {
+    if (!goal?.isActive) return;
+    if (!GOAL_WRITE_TOOLS.has(event.toolName)) return;
+    const targetPath = (event.input as { path?: unknown }).path;
+    if (typeof targetPath !== "string") return;
+    const decision = evaluateScope(targetPath, ctx.cwd);
+    if (decision.blocked) return { block: true, reason: decision.reason };
+  });
+
   pi.on("context", async (event) => {
     if (!goal?.isActive) return { messages: event.messages };
 
@@ -603,6 +753,24 @@ export default function(pi: ExtensionAPI) {
         timestamp: Date.now(),
       },
     ];
+
+    // Remind the agent of its active scope every turn so it stays in-bounds.
+    if (goalScope.allow.length || goalScope.deny.length) {
+      additions.push({
+        role: "custom" as const,
+        customType: GOAL_SCOPE_CUSTOM_TYPE,
+        content:
+          `<goal_scope critical="true">\n` +
+          `Only modify files within this scope. Writes outside it are blocked.\n` +
+          `Allowed: ${goalScope.allow.length ? goalScope.allow.join(", ") : "(any path not denied)"}\n` +
+          `Denied: ${goalScope.deny.length ? goalScope.deny.join(", ") : "(none)"}\n` +
+          `If a change genuinely requires touching an out-of-scope path, call goal_scope to update the scope first and note it in your completion evidence.\n` +
+          `</goal_scope>`,
+        display: false,
+        details: { goal },
+        timestamp: Date.now(),
+      });
+    }
 
     // One-shot gate injection: agent_end set the flag, this turn delivers
     // the full completion-gate prose and clears the flag. Going through the

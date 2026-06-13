@@ -91,7 +91,8 @@ const VOTE_SCHEMA = {
   },
 }
 
-const brief = (args && args.brief) || 'No research brief provided; rely on the context and your knowledge.'
+const BRIEF_PATH = '/Users/mish/.pi/agent/extensions/pi-goal-extension/docs/RESEARCH.md'
+const brief = `Read the full research brief first with: Read ${BRIEF_PATH} (and docs/research-findings.json for raw findings). Ground your ideas in it.`
 
 const LENSES = [
   { key: 'completion-honesty', angle: 'Focus on COMPLETION CORRECTNESS: preventing false "done", validation contracts / pre-written acceptance criteria, judge evaluation of the goal_complete evidence against the real diff, verifier-in-the-loop.' },

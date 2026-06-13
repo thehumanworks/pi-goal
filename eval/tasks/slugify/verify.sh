@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Oracle for the slugify task. Runs in the sandbox cwd. Exit 0 iff achieved.
 # The agent never sees this file.
-set -euo pipefail
+set -uo pipefail
+trap 'rm -f .verify.test.ts' EXIT
 
 cat > .verify.test.ts <<'EOF'
 import { slugify } from "./slug.ts";

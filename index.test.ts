@@ -24,12 +24,22 @@ type RegisteredTool = {
   ) => Promise<any> | any;
 };
 
+type ExecResult = {
+  stdout: string;
+  stderr: string;
+  code: number;
+  killed: boolean;
+};
+
 type TestHarness = {
   home: string;
   commands: Map<string, RegisteredCommand>;
   handlers: Map<string, Function>;
   tools: Map<string, RegisteredTool>;
   sentUserMessages: Array<{ text: string; options?: unknown }>;
+  execCalls: Array<{ command: string; args: string[]; options?: unknown }>;
+  thinkingLevels: string[];
+  abortCount: number;
   ctx: any;
   setFlag(name: string, value: unknown): void;
   executeTool(name: string, params: Record<string, unknown>): Promise<any>;
@@ -49,6 +59,12 @@ const createHarness = async (
   opts?: {
     isIdle?: () => boolean;
     sendUserMessage?: (text: string, options?: unknown) => void;
+    exec?: (
+      command: string,
+      args: string[],
+      options?: unknown,
+    ) => ExecResult | Promise<ExecResult>;
+    cwd?: string;
   },
 ): Promise<TestHarness> => {
   const home =
@@ -61,6 +77,12 @@ const createHarness = async (
   const tools = new Map<string, RegisteredTool>();
   const flags = new Map<string, unknown>();
   const sentUserMessages: Array<{ text: string; options?: unknown }> = [];
+  const execCalls: Array<{
+    command: string;
+    args: string[];
+    options?: unknown;
+  }> = [];
+  const thinkingLevels: string[] = [];
 
   const pi = {
     registerFlag(name: string) {
@@ -84,6 +106,14 @@ const createHarness = async (
       }
       sentUserMessages.push({ text, options });
     },
+    async exec(command: string, args: string[], options?: unknown) {
+      execCalls.push({ command, args, options });
+      if (opts?.exec) return await opts.exec(command, args, options);
+      return { stdout: "", stderr: "", code: 0, killed: false };
+    },
+    setThinkingLevel(level: string) {
+      thinkingLevels.push(level);
+    },
   } as unknown as ExtensionAPI;
 
   const { default: registerGoalExtension } = await import(
@@ -91,9 +121,14 @@ const createHarness = async (
   );
   registerGoalExtension(pi);
 
+  let abortCount = 0;
   const ctx = {
     hasUI: true,
+    cwd: opts?.cwd ?? home,
     isIdle: opts?.isIdle ?? (() => true),
+    abort: () => {
+      abortCount += 1;
+    },
     sessionManager: {
       getSessionId: () => "test-session",
     },
@@ -134,6 +169,11 @@ const createHarness = async (
     handlers,
     tools,
     sentUserMessages,
+    execCalls,
+    thinkingLevels,
+    get abortCount() {
+      return abortCount;
+    },
     ctx,
     setFlag,
     executeTool,
@@ -163,6 +203,21 @@ const expectSavedGoal = async (home: string): Promise<GoalJson> => {
   const goal = await readSavedGoal(home);
   expect(goal).not.toBeNull();
   return goal!;
+};
+
+// Poll the persisted goal until a predicate holds. Used where persistence is
+// fire-and-forget (e.g. the circuit breaker's hard-stop saves without awaiting).
+const waitForSavedGoal = async (
+  home: string,
+  predicate: (goal: GoalJson) => boolean,
+  attempts = 50,
+): Promise<GoalJson> => {
+  for (let i = 0; i < attempts; i++) {
+    const goal = await readSavedGoal(home);
+    if (goal && predicate(goal)) return goal;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("waitForSavedGoal: predicate not satisfied in time");
 };
 
 describe("goalManager SQLite persistence", () => {
@@ -597,9 +652,13 @@ describe("goal and task tracking tools", () => {
     // The tool result string keeps the brief headline summary so the chat
     // surface stays readable; the structured evidence lives in the
     // persisted completionSummary blob.
-    expect(complete.content[0].text).toBe(
+    expect(complete.content[0].text).toContain(
       "Goal marked complete: All work is done and verified.",
     );
+    // The sandbox has no package.json / .pi-goal.json, so the exec gate finds
+    // no verification commands and transparently flags completion as not
+    // machine-verified (graceful degradation) rather than blocking.
+    expect(complete.content[0].text).toContain("No validation commands discovered");
     const persistedGoal = await expectSavedGoal(harness.home);
     expect(persistedGoal.isActive).toBe(false);
     expect(persistedGoal.completedAt).not.toBeNull();
@@ -876,5 +935,156 @@ describe("headless/print-mode goal injection robustness", () => {
     expect(harness.sentUserMessages).toEqual([
       { text: "Headless goal", options: { deliverAs: "followUp" } },
     ]);
+  });
+});
+
+describe("gate-pass circuit breaker", () => {
+  test("raises the thinking level to high once on the GOAL_GATE_ESCALATE_AT-th consecutive gate pass", async () => {
+    const harness = await createHarness();
+    await harness.commands.get("goal")!.handler("Keep nudging", harness.ctx);
+
+    // Three consecutive gate passes with no edit/write in between.
+    for (let i = 0; i < 3; i++) {
+      harness.handlers.get("agent_end")!({ messages: [] }, harness.ctx);
+      await waitForDeferredCallbacks();
+    }
+
+    // Escalates exactly once at pass 3; default max (6) not reached, so no abort.
+    expect(harness.thinkingLevels).toEqual(["high"]);
+    expect(harness.abortCount).toBe(0);
+    expect((await expectSavedGoal(harness.home)).isActive).toBe(true);
+  });
+
+  test("hard-stops the gate and aborts after --goal-max-gate-passes consecutive passes", async () => {
+    const harness = await createHarness();
+    harness.setFlag("goal-max-gate-passes", "3");
+    await harness.commands.get("goal")!.handler("Loops forever", harness.ctx);
+
+    for (let i = 0; i < 3; i++) {
+      harness.handlers.get("agent_end")!({ messages: [] }, harness.ctx);
+      await waitForDeferredCallbacks();
+    }
+
+    expect(harness.abortCount).toBe(1);
+    // Hard-stop persists via fire-and-forget saveGoal(); poll until it commits.
+    const persisted = await waitForSavedGoal(harness.home, (g) => !g.isActive);
+    expect(persisted.isActive).toBe(false);
+    expect(persisted.completionSummary).toContain("hard-stopped");
+  });
+
+  test("resets the pass counter on edit/write tool execution so productive work is never hard-stopped", async () => {
+    const harness = await createHarness();
+    harness.setFlag("goal-max-gate-passes", "3");
+    await harness.commands.get("goal")!.handler("Productive goal", harness.ctx);
+
+    // Two stuck passes...
+    for (let i = 0; i < 2; i++) {
+      harness.handlers.get("agent_end")!({ messages: [] }, harness.ctx);
+      await waitForDeferredCallbacks();
+    }
+    // ...then genuine code progress resets the counter...
+    harness.handlers.get("tool_execution_end")!(
+      { type: "tool_execution_end", toolCallId: "t", toolName: "edit", result: {}, isError: false },
+      harness.ctx,
+    );
+    // ...so two more passes do NOT reach the max of 3.
+    for (let i = 0; i < 2; i++) {
+      harness.handlers.get("agent_end")!({ messages: [] }, harness.ctx);
+      await waitForDeferredCallbacks();
+    }
+
+    expect(harness.abortCount).toBe(0);
+    expect((await expectSavedGoal(harness.home)).isActive).toBe(true);
+  });
+});
+
+describe("exec-verified completion gate", () => {
+  const makeProject = (files: Record<string, string>) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-goal-proj-"));
+    homesToRemove.push(dir);
+    for (const [name, content] of Object.entries(files)) {
+      fs.writeFileSync(path.join(dir, name), content);
+    }
+    return dir;
+  };
+  const validEvidence = {
+    summary: "Done.",
+    requirementsCovered: "- X → slug.ts:1",
+    verificationsRun: "ran tests",
+    taskEvidence: "n/a",
+    shortcutsConsidered: "none",
+  };
+
+  test("blocks goal_complete when a verification command exits non-zero and routes the failure back", async () => {
+    const cwd = makeProject({ ".pi-goal.json": JSON.stringify({ validate: ["run-the-suite"] }) });
+    const harness = await createHarness(undefined, {
+      cwd,
+      exec: () => ({ stdout: "", stderr: "BOOM: 1 test failed", code: 1, killed: false }),
+    });
+    await harness.commands.get("goal")!.handler("Pass the suite", harness.ctx);
+
+    const result = await harness.executeTool("goal_complete", validEvidence);
+
+    expect(result.content[0].text).toContain("COMPLETION BLOCKED");
+    expect(result.content[0].text).toContain("BOOM: 1 test failed");
+    expect(result.content[0].text).toContain("run-the-suite");
+    expect(result.details.error).toBe("Completion blocked: verification failed");
+    // Not completed: goal stays active.
+    expect((await expectSavedGoal(harness.home)).isActive).toBe(true);
+    // The command was actually run via a shell in the project cwd.
+    expect(harness.execCalls).toHaveLength(1);
+    expect(harness.execCalls[0]!.command).toBe("bash");
+    expect((harness.execCalls[0]!.args as string[])[1]).toBe("run-the-suite");
+    expect((harness.execCalls[0]!.options as { cwd: string }).cwd).toBe(cwd);
+  });
+
+  test("accepts goal_complete when all verification commands pass", async () => {
+    const cwd = makeProject({ ".pi-goal.json": JSON.stringify({ validate: ["bun test", "tsc --noEmit"] }) });
+    const harness = await createHarness(undefined, {
+      cwd,
+      exec: () => ({ stdout: "ok", stderr: "", code: 0, killed: false }),
+    });
+    await harness.commands.get("goal")!.handler("Green build", harness.ctx);
+
+    const result = await harness.executeTool("goal_complete", validEvidence);
+
+    expect(result.content[0].text).toContain("Goal marked complete");
+    expect(result.content[0].text).toContain("Verified by 2 command(s): all passed.");
+    expect((await expectSavedGoal(harness.home)).isActive).toBe(false);
+    expect(harness.execCalls).toHaveLength(2);
+  });
+
+  test("discovers commands from package.json scripts (typecheck/test/lint) when no .pi-goal.json exists", async () => {
+    const cwd = makeProject({
+      "package.json": JSON.stringify({
+        scripts: { typecheck: "tsc --noEmit", test: "bun test", build: "tsc", lint: "eslint ." },
+      }),
+    });
+    const harness = await createHarness(undefined, {
+      cwd,
+      exec: () => ({ stdout: "", stderr: "", code: 0, killed: false }),
+    });
+    await harness.commands.get("goal")!.handler("Use package scripts", harness.ctx);
+
+    await harness.executeTool("goal_complete", validEvidence);
+
+    const ran = harness.execCalls.map((c) => (c.args as string[])[1]);
+    expect(ran).toEqual(["tsc --noEmit", "bun test", "eslint ."]); // build is not a validation script
+  });
+
+  test("--goal-no-exec-gate opt-out skips verification entirely", async () => {
+    const cwd = makeProject({ ".pi-goal.json": JSON.stringify({ validate: ["would-fail"] }) });
+    const harness = await createHarness(undefined, {
+      cwd,
+      exec: () => ({ stdout: "", stderr: "nope", code: 1, killed: false }),
+    });
+    harness.setFlag("goal-no-exec-gate", true);
+    await harness.commands.get("goal")!.handler("Skip the gate", harness.ctx);
+
+    const result = await harness.executeTool("goal_complete", validEvidence);
+
+    expect(harness.execCalls).toHaveLength(0);
+    expect(result.content[0].text).toBe("Goal marked complete: Done.");
+    expect((await expectSavedGoal(harness.home)).isActive).toBe(false);
   });
 });

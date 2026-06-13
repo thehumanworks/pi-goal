@@ -46,6 +46,20 @@ evidence-backed completion.
   audit, not an inlined checklist.
 - `formatters.ts` — goal-text normalization, elapsed-duration formatting.
 
+## Completion gate + safety (core variant)
+- **Exec-verified completion gate:** `goal_complete` runs the project's
+  verification commands via `pi.exec` and refuses completion on any non-zero
+  exit (the failing output is returned + armed into the next gate turn).
+  Commands are discovered in priority order: `.pi-goal.json` `{"validate":[...]}`
+  → `package.json` scripts (`typecheck`/`test`/`lint`, run as their raw command).
+  No commands found → completion proceeds but is flagged "not machine-verified".
+  Opt out with `--goal-no-exec-gate`.
+- **Gate-pass circuit breaker:** a counter increments on each `agent_end` gate
+  pass and resets on genuine code progress (`edit`/`write` tool execution). At
+  3 consecutive stuck passes it raises the thinking level once; at
+  `--goal-max-gate-passes` (default 6) it aborts and marks the goal stopped, so
+  an always-red exec gate or a text-only loop can't burn tokens forever.
+
 ## Loop mechanics (how the goal keeps the agent working)
 1. `before_agent_start` appends the mission prompt to the system prompt.
 2. `context` (fires before each LLM call) injects a `<goal_state>` custom-role

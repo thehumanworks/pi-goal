@@ -178,12 +178,15 @@ export default function(pi: ExtensionAPI) {
   };
 
   const sendGoalUserMessage = (goalText: string, isIdle: boolean) => {
-    if (isIdle) {
-      pi.sendUserMessage(goalText);
-      return;
-    }
-
-    pi.sendUserMessage(goalText, { deliverAs: "steer" });
+    // Never use a bare plain send (no deliverAs). In headless/print mode
+    // (`pi -p`), ctx.isIdle() can report idle at session_start while a prompt
+    // is already being processed; a plain send then async-rejects with "Agent
+    // is already processing" (the rejection is not synchronously catchable —
+    // see bindCore in pi-coding-agent's loader.js), so the run dies with zero
+    // turns. Always specify a delivery mode: `followUp` triggers a turn when
+    // genuinely idle and safely queues when busy; `steer` redirects a stream
+    // that is actually in progress. This mirrors the agent_end gate's delivery.
+    pi.sendUserMessage(goalText, { deliverAs: isIdle ? "followUp" : "steer" });
   };
 
   const noActiveGoal = () => ({

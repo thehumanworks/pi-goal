@@ -20,6 +20,20 @@ evidence-backed completion.
   `typebox` / its typebox-helpers). Tool parameter schemas use TypeBox.
 - The test harness in `index.test.ts` hand-rolls a fake `pi` ExtensionAPI and
   imports `./index.ts?test=<unique>` per test to get a fresh module instance.
+- **Never call `pi.sendUserMessage(text)` without a `deliverAs`.** In headless
+  `pi -p` mode, `ctx.isIdle()` can report idle at `session_start` while a prompt
+  is already being processed; a bare send then *async-rejects* with "Agent is
+  already processing" (not synchronously catchable — see bindCore in
+  pi-coding-agent's loader). Always pass `{ deliverAs: "followUp" }` (triggers a
+  turn when idle, queues when busy) or `"steer"`.
+- **The goal LOOP is interactive-only.** `pi -p` print mode runs exactly the
+  positional prompt as one agent loop and exits; it does NOT pump
+  extension-injected turns (neither the `session_start` goal injection nor the
+  `agent_end` completion-gate follow-up fire as turns). So the continuous gate
+  loop cannot be exercised end-to-end in `pi -p`. `tool_call`/`tool_result`
+  hooks DO fire during that single turn, so scope/lint-style variants are
+  e2e-testable; gate-loop behavior must be validated via the unit harness, which
+  simulates the lifecycle events directly.
 
 ## Architecture (current)
 - `index.ts` — extension entry: registers the `--goal` flag, `/goal` command,

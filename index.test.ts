@@ -44,7 +44,13 @@ const goalsDbPath = (home: string) => path.join(goalsDir(home), GOALS_DB_FILENAM
 const waitForDeferredCallbacks = () =>
   new Promise<void>((resolve) => setTimeout(resolve, 0));
 
-const createHarness = async (existingHome?: string): Promise<TestHarness> => {
+const createHarness = async (
+  existingHome?: string,
+  opts?: {
+    isIdle?: () => boolean;
+    sendUserMessage?: (text: string, options?: unknown) => void;
+  },
+): Promise<TestHarness> => {
   const home =
     existingHome ?? fs.mkdtempSync(path.join(os.tmpdir(), "pi-goal-extension-"));
   if (!existingHome) homesToRemove.push(home);
@@ -73,6 +79,9 @@ const createHarness = async (existingHome?: string): Promise<TestHarness> => {
       handlers.set(event, handler);
     },
     sendUserMessage(text: string, options?: unknown) {
+      if (opts?.sendUserMessage) {
+        opts.sendUserMessage(text, options);
+      }
       sentUserMessages.push({ text, options });
     },
   } as unknown as ExtensionAPI;
@@ -84,7 +93,7 @@ const createHarness = async (existingHome?: string): Promise<TestHarness> => {
 
   const ctx = {
     hasUI: true,
-    isIdle: () => true,
+    isIdle: opts?.isIdle ?? (() => true),
     sessionManager: {
       getSessionId: () => "test-session",
     },
@@ -243,7 +252,7 @@ describe("/goal slash command parsing", () => {
     expect(harness.sentUserMessages).toEqual([
       {
         text: "When defining a goal via the slash command, all remaining text is the single goal",
-        options: undefined,
+        options: { deliverAs: "followUp" },
       },
     ]);
   });
@@ -287,8 +296,10 @@ describe("goal lifecycle integration", () => {
     await harness.handlers.get("session_start")!({}, harness.ctx);
 
     expect((await expectSavedGoal(harness.home)).goal).toBe("Reach the flagged goal");
+    // Delivered with an explicit deliverAs (never a bare plain send) so it can
+    // never async-reject with "Agent is already processing" in headless mode.
     expect(harness.sentUserMessages).toEqual([
-      { text: "Reach the flagged goal", options: undefined },
+      { text: "Reach the flagged goal", options: { deliverAs: "followUp" } },
     ]);
   });
 
@@ -827,6 +838,43 @@ describe("goal continuation timer cleanup", () => {
     expect(harness.sentUserMessages.map((message) => message.text)).toEqual([
       "Original goal",
       "Replacement goal",
+    ]);
+  });
+});
+
+describe("headless/print-mode goal injection robustness", () => {
+  test("session_start delivers the flagged goal via a queued follow-up when a plain send throws 'Agent is already processing' (headless mode)", async () => {
+    // In `pi -p` print mode, ctx.isIdle() can report true at session_start
+    // while a prompt is already being processed, so a plain sendUserMessage
+    // (no deliverAs) throws "Agent is already processing" and kills the run
+    // with zero turns. The extension must recover by re-delivering as a
+    // queued follow-up instead of letting the throw escape session_start.
+    const harness = await createHarness(undefined, {
+      isIdle: () => true,
+      sendUserMessage: (_text, options) => {
+        const deliverAs = (options as { deliverAs?: string } | undefined)
+          ?.deliverAs;
+        if (!deliverAs) {
+          throw new Error(
+            "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+          );
+        }
+      },
+    });
+    harness.setFlag("goal", "Headless goal");
+
+    // Must not throw out of session_start.
+    await harness.handlers.get("session_start")!(
+      { type: "session_start", reason: "startup" },
+      harness.ctx,
+    );
+
+    // Goal is still persisted.
+    expect((await expectSavedGoal(harness.home)).goal).toBe("Headless goal");
+
+    // It was delivered via a queued follow-up (the only send that survived).
+    expect(harness.sentUserMessages).toEqual([
+      { text: "Headless goal", options: { deliverAs: "followUp" } },
     ]);
   });
 });

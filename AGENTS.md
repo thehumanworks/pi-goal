@@ -1,0 +1,55 @@
+# AGENTS.md — pi-goal-extension
+
+A `pi` coding-agent extension that drives a goal-oriented continuous loop: set a
+goal, keep working until it is achieved, and gate "stopping" behind structured,
+evidence-backed completion.
+
+## Commands
+- Install deps: `bun install`
+- Typecheck: `bunx tsc --noEmit` (must exit 0)
+- Test: `bun test` (Bun's built-in runner; tests live in `index.test.ts`)
+- Run a single test: `bun test -t "<name substring>"`
+
+## Critical facts / gotchas
+- **Package scope is `@earendil-works/*`, NOT `@mariozechner/*`.** Runtime value
+  imports must use `@earendil-works/pi-ai` and `@earendil-works/pi-coding-agent`.
+  The installed packages are under `node_modules/@earendil-works/`. Importing the
+  old `@mariozechner/*` scope makes 22/23 tests fail with "Cannot find module"
+  (it only survives for `import type`, which is erased at compile time).
+- `Type` and `StringEnum` come from `@earendil-works/pi-ai` (re-exported from
+  `typebox` / its typebox-helpers). Tool parameter schemas use TypeBox.
+- The test harness in `index.test.ts` hand-rolls a fake `pi` ExtensionAPI and
+  imports `./index.ts?test=<unique>` per test to get a fresh module instance.
+
+## Architecture (current)
+- `index.ts` — extension entry: registers the `--goal` flag, `/goal` command,
+  `goal_complete` tool (structured-evidence schema is the audit), `goal_task`
+  tool (todo list), and lifecycle hooks.
+- `goalManager.ts` — SQLite persistence (`~/.pi/agent/goals/goals.sqlite`),
+  keyed by session id, with a serialized async operation queue.
+- `prompts.ts` — the `<goal_state>` reminder, mission system prompt, and
+  completion-gate prose. Kept slim on purpose: the `goal_complete` schema is the
+  audit, not an inlined checklist.
+- `formatters.ts` — goal-text normalization, elapsed-duration formatting.
+
+## Loop mechanics (how the goal keeps the agent working)
+1. `before_agent_start` appends the mission prompt to the system prompt.
+2. `context` (fires before each LLM call) injects a `<goal_state>` custom-role
+   message — the live source of truth for tasks / next action. This is the only
+   delivery channel that reliably reaches the model across all providers
+   (cursor-agent strips synthetic user-message bodies from its envelope).
+3. `agent_end` arms a one-shot completion gate: a neutral trigger message
+   (`sendUserMessage(..., {deliverAs: "followUp"})`) forces another turn, and the
+   next `context` injection carries the gate prose. The agent must either keep
+   working or call `goal_complete` with every evidence field populated.
+
+## Useful extension API surface (from @earendil-works/pi-coding-agent)
+- Events can **block** (`tool_call` → `{block, reason}`) and **modify**
+  (`tool_result`, `message_end`, `context`). Also: `turn_start/end`,
+  `tool_execution_*`, `before/after_provider_*`, `session_*`, `resources_discover`
+  (contribute skill/prompt paths).
+- `pi.exec(cmd, args, opts)` runs shell commands (enables test/lint pressure).
+- `ctx.getContextUsage()` gives token usage; `ctx.compact()` triggers compaction;
+  `ctx.model` / `pi.setModel` / `pi.setThinkingLevel` adjust the model.
+- `pi.appendEntry` persists non-LLM state; `pi.events` is a shared bus.
+- Command handlers get `newSession`/`fork`/`navigateTree`/`switchSession`.

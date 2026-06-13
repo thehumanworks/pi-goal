@@ -3,8 +3,8 @@ import type {
   ExtensionAPI,
   ExtensionContext,
   BeforeAgentStartEventResult,
-} from "@mariozechner/pi-coding-agent";
-import { StringEnum, Type } from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-coding-agent";
+import { StringEnum, Type } from "@earendil-works/pi-ai";
 import path from "node:path";
 import {
   createGoalManager,

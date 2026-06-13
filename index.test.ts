@@ -1121,3 +1121,123 @@ describe("exec-verified completion gate", () => {
     expect((harness.execCalls.at(-1)!.args as string[])[1]).toContain("check-B");
   });
 });
+
+describe("scope enforcement", () => {
+  const writeCall = (path: string) => ({
+    type: "tool_call" as const,
+    toolCallId: "tc",
+    toolName: "write",
+    input: { path },
+  });
+
+  test("blocks writes outside the declared allowlist, permits in-scope writes, and never gates reads", async () => {
+    const harness = await createHarness();
+    await harness.commands.get("goal")!.handler("Implement slug", harness.ctx);
+    await harness.executeTool("goal_scope", { action: "set", allow: ["src/**", "slug.ts"] });
+
+    const inScope = harness.handlers.get("tool_call")!(writeCall("src/util/x.ts"), harness.ctx);
+    expect(inScope).toBeUndefined();
+
+    const outOfScope = harness.handlers.get("tool_call")!(writeCall("README.md"), harness.ctx);
+    expect(outOfScope).toEqual({ block: true, reason: expect.stringContaining("allowlist") });
+
+    // Reads are never gated, even out of scope.
+    const read = harness.handlers.get("tool_call")!(
+      { type: "tool_call", toolCallId: "tc", toolName: "read", input: { path: "README.md" } },
+      harness.ctx,
+    );
+    expect(read).toBeUndefined();
+  });
+
+  test("deny patterns block matching writes and take precedence over an empty allowlist", async () => {
+    const harness = await createHarness();
+    await harness.commands.get("goal")!.handler("Touch only app code", harness.ctx);
+    await harness.executeTool("goal_scope", { action: "set", deny: ["**/*.lock", "secrets/**"] });
+
+    expect(harness.handlers.get("tool_call")!(writeCall("bun.lock"), harness.ctx)).toEqual({
+      block: true,
+      reason: expect.stringContaining("deny"),
+    });
+    expect(harness.handlers.get("tool_call")!(writeCall("secrets/key.txt"), harness.ctx)).toEqual({
+      block: true,
+      reason: expect.stringContaining("deny"),
+    });
+    // No allowlist => anything not denied is permitted.
+    expect(harness.handlers.get("tool_call")!(writeCall("src/app.ts"), harness.ctx)).toBeUndefined();
+  });
+
+  test("no scope declared => no write is blocked", async () => {
+    const harness = await createHarness();
+    await harness.commands.get("goal")!.handler("Unconstrained", harness.ctx);
+    expect(harness.handlers.get("tool_call")!(writeCall("anything.ts"), harness.ctx)).toBeUndefined();
+  });
+
+  test("injects a <goal_scope> reminder into context only while a scope is set", async () => {
+    const harness = await createHarness();
+    await harness.commands.get("goal")!.handler("Scoped goal", harness.ctx);
+
+    const before = await harness.handlers.get("context")!(
+      { messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }] },
+      harness.ctx,
+    );
+    expect(before.messages.some((m: any) => m.customType === "goal-scope")).toBe(false);
+
+    await harness.executeTool("goal_scope", { action: "set", allow: ["pkg/**"] });
+    const after = await harness.handlers.get("context")!(
+      { messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }] },
+      harness.ctx,
+    );
+    const scopeMsg = after.messages.find((m: any) => m.customType === "goal-scope");
+    expect(scopeMsg).toBeDefined();
+    expect(scopeMsg.content).toContain("pkg/**");
+  });
+
+  test("goal_scope clear removes constraints and replacing the goal resets scope", async () => {
+    const harness = await createHarness();
+    await harness.commands.get("goal")!.handler("First", harness.ctx);
+    await harness.executeTool("goal_scope", { action: "set", deny: ["dist/**"] });
+    expect(harness.handlers.get("tool_call")!(writeCall("dist/x.js"), harness.ctx)).toEqual({
+      block: true,
+      reason: expect.stringContaining("deny"),
+    });
+
+    await harness.executeTool("goal_scope", { action: "clear" });
+    expect(harness.handlers.get("tool_call")!(writeCall("dist/x.js"), harness.ctx)).toBeUndefined();
+
+    await harness.executeTool("goal_scope", { action: "set", deny: ["dist/**"] });
+    // Replacing the goal must wipe scope.
+    await harness.commands.get("goal")!.handler("Second", harness.ctx);
+    expect(harness.handlers.get("tool_call")!(writeCall("dist/x.js"), harness.ctx)).toBeUndefined();
+  });
+
+  test("normalizes absolute paths against cwd before matching the scope", async () => {
+    const harness = await createHarness();
+    await harness.commands.get("goal")!.handler("Abs paths", harness.ctx);
+    await harness.executeTool("goal_scope", { action: "set", allow: ["src/**"] });
+    const cwd = harness.ctx.cwd as string;
+
+    // Absolute path inside the in-scope dir is permitted.
+    expect(
+      harness.handlers.get("tool_call")!(writeCall(`${cwd}/src/deep/x.ts`), harness.ctx),
+    ).toBeUndefined();
+    // Absolute path outside the allowlist is blocked.
+    expect(
+      harness.handlers.get("tool_call")!(writeCall(`${cwd}/README.md`), harness.ctx),
+    ).toEqual({ block: true, reason: expect.stringContaining("allowlist") });
+  });
+
+  test("blocks ../ traversal that would otherwise slip past an allowlist", async () => {
+    const harness = await createHarness();
+    await harness.commands.get("goal")!.handler("No escaping", harness.ctx);
+    await harness.executeTool("goal_scope", { action: "set", allow: ["src/**"] });
+
+    // src/../../secret.ts normalizes to ../secret.ts -> outside src/** -> blocked.
+    expect(
+      harness.handlers.get("tool_call")!(writeCall("src/../../secret.ts"), harness.ctx),
+    ).toEqual({ block: true, reason: expect.stringContaining("allowlist") });
+    // A normal nested in-scope path still passes.
+    expect(
+      harness.handlers.get("tool_call")!(writeCall("src/a/./b.ts"), harness.ctx),
+    ).toBeUndefined();
+  });
+});

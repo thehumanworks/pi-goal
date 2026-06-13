@@ -1,0 +1,4 @@
+# Files the agent is allowed to touch for this task.
+slug.ts
+# allow git internals created by the harness
+.git/**

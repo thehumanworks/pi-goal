@@ -1,0 +1,9 @@
+Implement the slugify(input) function in slug.ts. Rules, in order:
+1. Lowercase the input.
+2. Treat every character that is NOT in a-z or 0-9 as a separator.
+3. Collapse any run of one or more separators into a single hyphen "-".
+4. Strip leading and trailing hyphens.
+
+Example: "  Hello,  World!! " -> "hello-world".
+Keep the exact existing export signature `export function slugify(input: string): string`.
+Edit ONLY slug.ts. Verify your implementation handles edge cases (empty/whitespace-only input, leading/trailing punctuation, repeated separators) before considering the goal complete.

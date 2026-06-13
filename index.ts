@@ -229,6 +229,7 @@ export default function(pi: ExtensionAPI) {
     clearGoalContinuationTimer();
     pendingGateInjection = false;
     gatePassCount = 0;
+    validationCommands = null;
     goal = nextGoal;
     goalSessionId = sessionId;
   };
@@ -239,6 +240,7 @@ export default function(pi: ExtensionAPI) {
     clearGoalContinuationTimer();
     pendingGateInjection = false;
     gatePassCount = 0;
+    validationCommands = null;
     goal = persistedGoal;
     goalSessionId = sessionId;
   };
@@ -264,10 +266,16 @@ export default function(pi: ExtensionAPI) {
       return { blocked: false, commandCount: 0 };
 
     for (const command of validationCommands) {
-      const result = await pi.exec("bash", ["-lc", command], {
-        cwd,
-        timeout: GOAL_EXEC_TIMEOUT_MS,
-      });
+      // Prepend the project's local bin to PATH so package.json scripts and
+      // .pi-goal.json commands can invoke locally-installed tools (jest, tsc,
+      // eslint, vitest, …) the same way `npm run`/`bun run` would. Without
+      // this, `bash -lc jest` fails with "command not found" (a non-zero exit
+      // that would falsely block completion).
+      const result = await pi.exec(
+        "bash",
+        ["-lc", `export PATH="$PWD/node_modules/.bin:$PATH"; ${command}`],
+        { cwd, timeout: GOAL_EXEC_TIMEOUT_MS },
+      );
       if (result.code !== 0) {
         const combined = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.trim();
         const output =
@@ -635,7 +643,7 @@ export default function(pi: ExtensionAPI) {
     if (!goal?.isActive) return;
 
     clearGoalContinuationTimer();
-    goalContinuationTimer = setTimeout(() => {
+    goalContinuationTimer = setTimeout(async () => {
       goalContinuationTimer = null;
       const activeGoal = goal;
       if (!activeGoal?.isActive) return;
@@ -664,7 +672,10 @@ export default function(pi: ExtensionAPI) {
           `without code progress: the agent neither completed the goal nor ` +
           `made edits between gate passes. Refine the goal or raise ` +
           `--${GOAL_MAX_GATE_PASSES_FLAG}.`;
-        void saveGoal();
+        // Await persistence before aborting: ctx.abort() may tear down the
+        // run, and an unawaited save could be lost, leaving a stale active
+        // goal that wrongly resumes on the next session_start.
+        await saveGoal();
         clearGoalStatusTimer();
         setGoalStatus(
           ctx,

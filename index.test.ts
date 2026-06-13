@@ -965,11 +965,12 @@ describe("gate-pass circuit breaker", () => {
       await waitForDeferredCallbacks();
     }
 
-    expect(harness.abortCount).toBe(1);
-    // Hard-stop persists via fire-and-forget saveGoal(); poll until it commits.
+    // The hard-stop continuation awaits saveGoal() before calling ctx.abort(),
+    // so once the persisted goal is observably inactive, abort has run too.
     const persisted = await waitForSavedGoal(harness.home, (g) => !g.isActive);
     expect(persisted.isActive).toBe(false);
     expect(persisted.completionSummary).toContain("hard-stopped");
+    expect(harness.abortCount).toBe(1);
   });
 
   test("resets the pass counter on edit/write tool execution so productive work is never hard-stopped", async () => {
@@ -1031,10 +1032,13 @@ describe("exec-verified completion gate", () => {
     expect(result.details.error).toBe("Completion blocked: verification failed");
     // Not completed: goal stays active.
     expect((await expectSavedGoal(harness.home)).isActive).toBe(true);
-    // The command was actually run via a shell in the project cwd.
+    // The command was actually run via a shell in the project cwd, with the
+    // project's local bin prepended to PATH so locally-installed tools resolve.
     expect(harness.execCalls).toHaveLength(1);
     expect(harness.execCalls[0]!.command).toBe("bash");
-    expect((harness.execCalls[0]!.args as string[])[1]).toBe("run-the-suite");
+    const shellScript = (harness.execCalls[0]!.args as string[])[1]!;
+    expect(shellScript).toContain("run-the-suite");
+    expect(shellScript).toContain("node_modules/.bin");
     expect((harness.execCalls[0]!.options as { cwd: string }).cwd).toBe(cwd);
   });
 
@@ -1068,8 +1072,14 @@ describe("exec-verified completion gate", () => {
 
     await harness.executeTool("goal_complete", validEvidence);
 
-    const ran = harness.execCalls.map((c) => (c.args as string[])[1]);
-    expect(ran).toEqual(["tsc --noEmit", "bun test", "eslint ."]); // build is not a validation script
+    // Only typecheck/test/lint scripts are run (not "build"), in that order;
+    // each is wrapped with the local-bin PATH prefix.
+    const ran = harness.execCalls.map((c) => (c.args as string[])[1]!);
+    expect(ran).toHaveLength(3);
+    expect(ran[0]).toContain("tsc --noEmit");
+    expect(ran[1]).toContain("bun test");
+    expect(ran[2]).toContain("eslint .");
+    expect(ran.some((s) => s.includes("build"))).toBe(false);
   });
 
   test("--goal-no-exec-gate opt-out skips verification entirely", async () => {
@@ -1086,5 +1096,28 @@ describe("exec-verified completion gate", () => {
     expect(harness.execCalls).toHaveLength(0);
     expect(result.content[0].text).toBe("Goal marked complete: Done.");
     expect((await expectSavedGoal(harness.home)).isActive).toBe(false);
+  });
+
+  test("re-discovers validation commands when the goal is replaced (no stale cache)", async () => {
+    const cwd = makeProject({ ".pi-goal.json": JSON.stringify({ validate: ["check-A"] }) });
+    const harness = await createHarness(undefined, {
+      cwd,
+      exec: () => ({ stdout: "", stderr: "", code: 0, killed: false }),
+    });
+
+    await harness.commands.get("goal")!.handler("First goal", harness.ctx);
+    await harness.executeTool("goal_complete", validEvidence);
+    expect((harness.execCalls.at(-1)!.args as string[])[1]).toContain("check-A");
+
+    // Change the project's validation commands, then replace the goal. The
+    // cached command list must be invalidated so the new commands are used.
+    fs.writeFileSync(
+      path.join(cwd, ".pi-goal.json"),
+      JSON.stringify({ validate: ["check-B"] }),
+    );
+    await harness.commands.get("goal")!.handler("Second goal", harness.ctx);
+    await harness.executeTool("goal_complete", validEvidence);
+
+    expect((harness.execCalls.at(-1)!.args as string[])[1]).toContain("check-B");
   });
 });

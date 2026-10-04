@@ -93,3 +93,23 @@ evidence-backed completion.
   `ctx.model` / `pi.setModel` / `pi.setThinkingLevel` adjust the model.
 - `pi.appendEntry` persists non-LLM state; `pi.events` is a shared bus.
 - Command handlers get `newSession`/`fork`/`navigateTree`/`switchSession`.
+
+## Optional verifier completion gate
+
+The separate sibling `../verifier` extension supplies an independent read-only
+completion reviewer over `pi.events` (`verification.ts` contains the protocol).
+The goal extension has no import of the verifier implementation and retains
+standalone behavior when the verifier is absent or disabled.
+
+`/verifier on|off` follows advisor's enabled-on-load, runtime-only pattern. Only
+`VERIFIER_PROVIDER` and `VERIFIER_MODEL_ID` configure its model, with no fallback.
+`goal_task check` waits for approval before saving. Rejection keeps the task open,
+blocks remaining sibling tool calls in that batch, and keeps corrective feedback
+in context until the failed task passes (or the user disables verification).
+`goal_complete` retains the exec gate, then verifies all unchecked tasks and the
+whole goal before its final save. Completion tools are sequential so the lead
+cannot execute later sibling actions while review is pending.
+
+Evidence, limitations, and exact commands: `docs/VERIFIER.md`. Focused runtime
+checks: `cd ../verifier && pnpm run check`; original goal regressions remain
+`bun test index.test.ts`. No changes to SQLite schema or goal contract format.

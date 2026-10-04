@@ -32,3 +32,7 @@ pnpm-debug.log*
 
 # Local Cursor agent state
 .cursor/hooks/state/
+
+# Completion-verifier test evidence
+!docs/verifier-goal-tests.log
+!docs/verifier-runtime-tests.log

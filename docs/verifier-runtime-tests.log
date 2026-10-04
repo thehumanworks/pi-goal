@@ -1,0 +1,36 @@
+$ pnpm run typecheck && pnpm test
+$ tsc --noEmit
+$ bun test ./tests
+bun test v1.4.2 (744846f84)
+
+tests/runtime.test.ts:
+(pass) optional verifier completion gate in the real Pi runtime > goal works unchanged with no verifier extension installed [392.34ms]
+(pass) optional verifier completion gate in the real Pi runtime > /verifier on and off remain available in both states and do not alter goal/advisor tools or settings [46.41ms]
+(pass) optional verifier completion gate in the real Pi runtime > verifier can be loaded and toggled without the goal extension loaded [17.90ms]
+(pass) optional verifier completion gate in the real Pi runtime > env-selected verifier inspects actual files and receives the existing contract, history, and task [38.62ms]
+(pass) optional verifier completion gate in the real Pi runtime > no completion, sibling action, or next lead request happens until the verifier resolves [34.60ms]
+(pass) optional verifier completion gate in the real Pi runtime > rejection blocks sibling continuation and later completions; repairs and a passing retry release the gate [66.53ms]
+(pass) optional verifier completion gate in the real Pi runtime > disabling a rejected verifier releases only the optional gate and preserves normal goal completion [167.34ms]
+(pass) optional verifier completion gate in the real Pi runtime > goal_complete verifies every unchecked task and the whole goal before an atomic final save [191.05ms]
+(pass) optional verifier completion gate in the real Pi runtime > bulk completion cannot bypass a rejecting task or partially mark sibling tasks done [186.91ms]
+(pass) optional verifier completion gate in the real Pi runtime > whole-goal verification also gates goals without tracked tasks [172.58ms]
+(pass) optional verifier completion gate in the real Pi runtime > existing red exec gate still rejects before invoking the optional verifier [177.03ms]
+(pass) optional verifier completion gate in the real Pi runtime > missing or invalid verifier configuration blocks without fallback: /independent-reviewer [26.73ms]
+(pass) optional verifier completion gate in the real Pi runtime > missing or invalid verifier configuration blocks without fallback: verifier-fixture/  [30.36ms]
+(pass) optional verifier completion gate in the real Pi runtime > missing or invalid verifier configuration blocks without fallback: unknown-fixture/independent-reviewer [24.89ms]
+(pass) optional verifier completion gate in the real Pi runtime > missing or invalid verifier configuration blocks without fallback: verifier-fixture/wrong-model [26.10ms]
+(pass) optional verifier completion gate in the real Pi runtime > missing or invalid verifier configuration blocks without fallback: unauthenticated-fixture/independent-reviewer [26.22ms]
+(pass) optional verifier completion gate in the real Pi runtime > unusable verifier verdict cannot mark a task complete: "" [28.87ms]
+(pass) optional verifier completion gate in the real Pi runtime > unusable verifier verdict cannot mark a task complete: "not JSON" [29.58ms]
+(pass) optional verifier completion gate in the real Pi runtime > unusable verifier verdict cannot mark a task complete: "{\"pass\":\"true\",\"feedback\":\"done\"}" [30.31ms]
+(pass) optional verifier completion gate in the real Pi runtime > unusable verifier verdict cannot mark a task complete: "{\"pass\":true,\"feedback\":\"\"}" [27.17ms]
+(pass) optional verifier completion gate in the real Pi runtime > unusable verifier verdict cannot mark a task complete: "{\"feedback\":\"done\"}" [29.16ms]
+(pass) optional verifier completion gate in the real Pi runtime > HTTP failure is a rejected completion, never a fallback to the lead [24.16ms]
+(pass) optional verifier completion gate in the real Pi runtime > a truncated verifier response is not accepted even if its partial JSON says pass [28.43ms]
+(pass) optional verifier completion gate in the real Pi runtime > aborting a pending review never saves completion or runs a sibling continuation [27.26ms]
+(pass) optional verifier completion gate in the real Pi runtime > reload rebinds one verifier and retains persisted incomplete task state [33.35ms]
+
+ 25 pass
+ 0 fail
+ 141 expect() calls
+Ran 25 tests across 1 file. [2.42s]

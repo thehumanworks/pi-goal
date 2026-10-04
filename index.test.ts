@@ -85,6 +85,7 @@ const createHarness = async (
   const thinkingLevels: string[] = [];
 
   const pi = {
+    events: { emit() {}, on() { return () => {}; } },
     registerFlag(name: string) {
       flags.set(name, undefined);
     },

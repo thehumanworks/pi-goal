@@ -26,6 +26,11 @@ import {
   formatGoalState,
 } from "./prompts.ts";
 
+import {
+  GOAL_VERIFIER_CHANNEL, type CompletionReview, type ReviewCompletion,
+  type ValidationEvidence, type VerifierDiscovery,
+} from "./verification.ts";
+
 const GOALS_DIR = path.join(process.env.HOME!, ".pi", "agent", "goals");
 const GOAL_STATUS_UPDATE_INTERVAL_MS = 1000;
 const GOAL_STATE_CUSTOM_TYPE = "goal-state";
@@ -216,6 +221,9 @@ export default function(pi: ExtensionAPI) {
   // Validation commands for the exec-verified completion gate, discovered once
   // lazily (null = not yet probed).
   let validationCommands: string[] | null = null;
+  let verifierBlock: { taskId?: number; report: string } | undefined;
+  let rejectedToolBatch = false;
+  let disposed = false;
   // In-memory scope for the active goal (session-scoped; re-declare after a
   // reload). allow: paths the agent may modify; deny: paths it must not.
   let goalScope: { allow: string[]; deny: string[] } = { allow: [], deny: [] };
@@ -289,6 +297,8 @@ export default function(pi: ExtensionAPI) {
     pendingGateInjection = false;
     gatePassCount = 0;
     validationCommands = null;
+    verifierBlock = undefined;
+    rejectedToolBatch = false;
     goalScope = { allow: [], deny: [] };
     goal = nextGoal;
     goalSessionId = sessionId;
@@ -301,6 +311,8 @@ export default function(pi: ExtensionAPI) {
     pendingGateInjection = false;
     gatePassCount = 0;
     validationCommands = null;
+    verifierBlock = undefined;
+    rejectedToolBatch = false;
     goalScope = { allow: [], deny: [] };
     goal = persistedGoal;
     goalSessionId = sessionId;
@@ -350,14 +362,15 @@ export default function(pi: ExtensionAPI) {
   // the failing command + truncated output) on the first non-zero exit, or
   // {blocked:false} when everything passes or no commands are discoverable.
   type GateResult =
-    | { blocked: false; commandCount: number }
+    | { blocked: false; commandCount: number; results: ValidationEvidence[] }
     | { blocked: true; report: string };
   const runValidationGate = async (cwd: string): Promise<GateResult> => {
     if (validationCommands === null)
       validationCommands = discoverValidationCommands(cwd);
     if (validationCommands.length === 0)
-      return { blocked: false, commandCount: 0 };
+      return { blocked: false, commandCount: 0, results: [] };
 
+    const results: ValidationEvidence[] = [];
     for (const command of validationCommands) {
       // Prepend the project's local bin to PATH so package.json scripts and
       // .pi-goal.json commands can invoke locally-installed tools (jest, tsc,
@@ -369,6 +382,8 @@ export default function(pi: ExtensionAPI) {
         ["-lc", `export PATH="$PWD/node_modules/.bin:$PATH"; ${command}`],
         { cwd, timeout: GOAL_EXEC_TIMEOUT_MS },
       );
+      results.push({ command, code: result.code, killed: result.killed,
+        stdout: result.stdout.slice(-GOAL_EXEC_OUTPUT_CAP), stderr: result.stderr.slice(-GOAL_EXEC_OUTPUT_CAP) });
       if (result.code !== 0) {
         const combined = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.trim();
         const output =
@@ -386,7 +401,67 @@ export default function(pi: ExtensionAPI) {
         };
       }
     }
-    return { blocked: false, commandCount: validationCommands.length };
+    return { blocked: false, commandCount: validationCommands.length, results };
+  };
+
+  const getVerifier = (ctx: ExtensionContext): ReviewCompletion | undefined => {
+    let review: ReviewCompletion | undefined;
+    const discovery: VerifierDiscovery = {
+      sessionId: ctx.sessionManager.getSessionId(),
+      provide(candidate) { review = candidate; },
+    };
+    pi.events.emit(GOAL_VERIFIER_CHANNEL, discovery);
+    if (!review) verifierBlock = undefined; // Disabled/uninstalled means original behavior.
+    return review;
+  };
+
+  const rejectCompletion = (feedback: string, task?: GoalTask) => {
+    const retry = task ? `Fix task #${task.id} and retry goal_task check for that id before completing any later task or the goal.`
+      : "Fix the unmet requirements and retry goal_complete before moving on.";
+    const report = `COMPLETION BLOCKED by verifier: ${feedback}\n\n${retry}`;
+    verifierBlock = { taskId: task?.id, report };
+    rejectedToolBatch = true;
+    pendingGateInjection = true;
+    return {
+      content: [{ type: "text" as const, text: report }],
+      details: { goal, error: "Completion blocked: verifier rejected", verification: { pass: false, feedback } },
+    };
+  };
+
+  const reviewCompletion = async (
+    review: ReviewCompletion, ctx: ExtensionContext, signal: AbortSignal | undefined,
+    task?: GoalTask, evidence?: Record<string, string>, validationResults?: ValidationEvidence[],
+  ) => {
+    const reviewedGoal = goal!;
+    const sessionId = goalSessionId;
+    try {
+      signal?.throwIfAborted();
+      const request: CompletionReview = {
+        cwd: ctx.cwd, goal: structuredClone(reviewedGoal), task: task && { ...task }, evidence,
+        contract: {
+          evidenceFields: Object.fromEntries(Object.entries(GoalCompleteParams.properties)
+            .map(([name, schema]) => [name, (schema as { description?: string }).description ?? ""])),
+          validationCommands: discoverValidationCommands(ctx.cwd),
+        },
+        validationResults,
+        history: ctx.sessionManager.getBranch(), signal,
+      };
+      const verdict = await review(request);
+      signal?.throwIfAborted();
+      if (disposed || goal !== reviewedGoal || goalSessionId !== sessionId) {
+        throw new Error("The goal/session changed during verification. Retry completion for the current goal.");
+      }
+      if (!verdict || typeof verdict.pass !== "boolean" || typeof verdict.feedback !== "string" || !verdict.feedback.trim()) {
+        throw new Error("Verifier returned no valid verdict. Retry verification before completing this task.");
+      }
+      if (!verdict.pass) return rejectCompletion(verdict.feedback, task);
+      if (verifierBlock?.taskId === task?.id) verifierBlock = undefined;
+      return undefined;
+    } catch (error) {
+      // A late result must never mutate or reject a replacement goal/session.
+      if (disposed || goal !== reviewedGoal || goalSessionId !== sessionId) throw error;
+      return rejectCompletion(error instanceof Error ? error.message : String(error), task);
+    }
   };
 
   const sendGoalUserMessage = (goalText: string, isIdle: boolean) => {
@@ -500,13 +575,20 @@ export default function(pi: ExtensionAPI) {
     description:
       "Mark the active goal as complete. ALL evidence fields (summary, requirementsCovered, verificationsRun, taskEvidence, shortcutsConsidered) are required and each must cite concrete artifacts (file:line, exact test names, exact command output). Vague, generic, or empty values mean the goal is not yet complete — keep working instead. Calling this tool is the audit; there is no separate audit step that excuses missing evidence here.",
     parameters: GoalCompleteParams,
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    executionMode: "sequential",
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       if (!goal) return noActiveGoal();
+      const review = getVerifier(ctx);
+      if (review && verifierBlock?.taskId !== undefined) {
+        return rejectCompletion(verifierBlock.report, goal.tasks.find((task) => task.id === verifierBlock!.taskId));
+      }
+      const completingGoal = goal;
 
       // Exec-verified gate: completion is gated on real exit codes, not just
       // the self-narrated evidence schema. A red check blocks completion and
       // routes the failing output back so the agent keeps working.
       let verificationNote = "";
+      let validationResults: ValidationEvidence[] | undefined;
       if (pi.getFlag(GOAL_NO_EXEC_GATE_FLAG) !== true) {
         const gate = await runValidationGate(ctx.cwd);
         if (gate.blocked) {
@@ -519,10 +601,22 @@ export default function(pi: ExtensionAPI) {
             } as GoalToolDetails,
           };
         }
+        validationResults = gate.results;
         verificationNote =
           gate.commandCount > 0 ?
             ` Verified by ${gate.commandCount} command(s): all passed.`
           : " No validation commands discovered (.pi-goal.json or package.json scripts); completion not machine-verified.";
+      }
+
+      if (goal !== completingGoal || disposed) throw new Error("The goal changed before completion; retry for the current goal.");
+      if (review) {
+        // goal_complete also checks remaining tasks, so it cannot bypass per-task review.
+        for (const task of goal.tasks.filter((candidate) => !candidate.isComplete)) {
+          const rejected = await reviewCompletion(review, ctx, signal, task, params, validationResults);
+          if (rejected) return rejected;
+        }
+        const rejected = await reviewCompletion(review, ctx, signal, undefined, params, validationResults);
+        if (rejected) return rejected;
       }
 
       goal.isActive = false;
@@ -558,7 +652,8 @@ export default function(pi: ExtensionAPI) {
     description:
       "Manage tasks for the active goal. Use add to create tasks, check to mark one complete, uncheck to reopen one, and list to inspect progress.",
     parameters: GoalTaskParams,
-    async execute(_toolCallId, params) {
+    executionMode: "sequential",
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       if (!goal) return noActiveGoal();
 
       const action = params.action;
@@ -639,6 +734,14 @@ export default function(pi: ExtensionAPI) {
       }
 
       if (action === "check") {
+        const review = getVerifier(ctx);
+        if (review) {
+          if (verifierBlock?.taskId !== undefined && verifierBlock.taskId !== task.id) {
+            return rejectCompletion(verifierBlock.report, goal.tasks.find((candidate) => candidate.id === verifierBlock!.taskId));
+          }
+          const rejected = await reviewCompletion(review, ctx, signal, task);
+          if (rejected) return rejected;
+        }
         task.isComplete = true;
         task.completedAt = now();
         await saveGoal();
@@ -731,7 +834,20 @@ export default function(pi: ExtensionAPI) {
   // allowed. NOTE: this does NOT intercept bash-based writes (echo >, tee,
   // sed -i, cp, …) — scope is a guardrail against accidental edit/write drift,
   // not a security sandbox. A determined agent can still mutate via bash.
+  pi.on("turn_start", () => { rejectedToolBatch = false; });
+
+  pi.on("tool_result", (event) => {
+    if (event.toolName !== "goal_task" && event.toolName !== "goal_complete") return;
+    const details = event.details as { verification?: { pass: boolean } } | undefined;
+    if (details?.verification?.pass === false) return { isError: true };
+  });
+
   pi.on("tool_call", (event, ctx) => {
+    // Completion tools serialize the whole batch. A rejected completion blocks
+    // all later sibling calls until a fresh lead turn can act on the feedback.
+    if (rejectedToolBatch && getVerifier(ctx)) {
+      return { block: true, reason: verifierBlock?.report ?? "Completion verification failed. Act on its feedback before continuing." };
+    }
     if (!goal?.isActive) return;
     if (!GOAL_WRITE_TOOLS.has(event.toolName)) return;
     const targetPath = (event.input as { path?: unknown }).path;
@@ -740,7 +856,7 @@ export default function(pi: ExtensionAPI) {
     if (decision.blocked) return { block: true, reason: decision.reason };
   });
 
-  pi.on("context", async (event) => {
+  pi.on("context", async (event, ctx) => {
     if (!goal?.isActive) return { messages: event.messages };
 
     const additions = [
@@ -753,6 +869,14 @@ export default function(pi: ExtensionAPI) {
         timestamp: Date.now(),
       },
     ];
+
+    if (verifierBlock && getVerifier(ctx)) {
+      additions.push({
+        role: "custom" as const, customType: "goal-verifier-block",
+        content: `<verification_block>\n${verifierBlock.report}\n</verification_block>`,
+        display: false, details: { goal }, timestamp: Date.now(),
+      });
+    }
 
     // Remind the agent of its active scope every turn so it stays in-bounds.
     if (goalScope.allow.length || goalScope.deny.length) {
@@ -917,9 +1041,10 @@ export default function(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    disposed = true;
     clearGoalContinuationTimer();
     clearGoalStatusTimer();
     setGoalStatus(ctx, undefined);
-    goalManager.close();
+    await goalManager.close();
   });
 }

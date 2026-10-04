@@ -13,6 +13,9 @@
     "sqlite3": "^6.0.1",
     "valibot": "^1.3.1"
   },
+  "patchedDependencies": {
+    "sqlite3@6.0.1": "patches/sqlite3@6.0.1.patch"
+  },
   "trustedDependencies": [
     "@google/genai",
     "koffi",

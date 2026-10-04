@@ -1,0 +1,12 @@
+diff --git a/lib/sqlite3-binding.js b/lib/sqlite3-binding.js
+index 9bde4ea..fa58e4b 100644
+--- a/lib/sqlite3-binding.js
++++ b/lib/sqlite3-binding.js
+@@ -1 +1,6 @@
+-module.exports = require('bindings')('node_sqlite3.node');
++// Jiti in a compiled Bun host can expose "[native code]" as the caller.
++// Resolve from this module instead of relying on bindings' stack inspection.
++module.exports = require('bindings')({
++    bindings: 'node_sqlite3.node',
++    module_root: require('path').resolve(__dirname, '..')
++});

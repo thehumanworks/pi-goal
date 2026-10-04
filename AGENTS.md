@@ -11,6 +11,10 @@ evidence-backed completion.
 - Run a single test: `bun test -t "<name substring>"`
 
 ## Critical facts / gotchas
+- `sqlite3` has a Bun dependency patch in `patches/` that supplies an explicit
+  `module_root` to `bindings`. Keep it when updating dependencies: compiled pi's
+  Jiti loader otherwise makes stack-based discovery see `"[native code]"`.
+  `loader.test.ts` checks the installed `pi` loader offline (skips if absent).
 - **Package scope is `@earendil-works/*`, NOT `@mariozechner/*`.** Runtime value
   imports must use `@earendil-works/pi-ai` and `@earendil-works/pi-coding-agent`.
   The installed packages are under `node_modules/@earendil-works/`. Importing the

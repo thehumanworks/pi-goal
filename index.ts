@@ -1,4 +1,3 @@
-#!/usr/bin/env -S bun
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -206,7 +205,7 @@ const GoalScopeParams = Type.Object({
 // Re-exported so existing imports of this module keep working.
 export { normalizeGoalText };
 
-export default function(pi: ExtensionAPI) {
+export default function(pi: ExtensionAPI): void {
   const goalManager = createGoalManager(GOALS_DIR);
   let goal: GoalJson | null = null;
   let goalSessionId: string | null = null;

@@ -36,3 +36,5 @@ pnpm-debug.log*
 # Completion-verifier test evidence
 !docs/verifier-goal-tests.log
 !docs/verifier-runtime-tests.log
+
+.direnv

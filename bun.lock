@@ -4,9 +4,11 @@
   "workspaces": {
     "": {
       "name": "pi-goal-extension",
+      "peerDependencies": {
+        "@earendil-works/pi-ai": "*",
+        "@earendil-works/pi-coding-agent": "*",
+      },
       "dependencies": {
-        "@earendil-works/pi-ai": "^0.74.0",
-        "@earendil-works/pi-coding-agent": "^0.74.0",
         "sqlite3": "^6.0.1",
         "valibot": "^1.3.1",
       },

@@ -24,6 +24,7 @@ test.skipIf(!pi)("installed pi loads goal and registers its command", () => {
     });
     expect(result.error).toBeUndefined();
     expect(result.stderr).not.toContain("Failed to load extension");
+    expect(result.stderr).not.toContain("Host-provided extension packages");
     expect(result.status).toBe(0);
     const response = result.stdout.split("\n").filter(Boolean)
       .map((line) => JSON.parse(line))

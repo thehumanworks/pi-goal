@@ -32,11 +32,11 @@ ${formatGoalTaskList(goal)}
 
 Next task/action: ${formatNextGoalAction(goal)}
 
-Instruction: Treat this as the latest source of truth for the active goal. Continue with the next incomplete task. If no incomplete tasks remain, do not stop — call goal_complete and fill every required evidence field with concrete artifacts (file:line, exact test names, exact command output). The tool's schema is the audit; vague answers there mean the goal is not done.
+Instruction: The latest goal snapshot supersedes all earlier goal, task, scope, verifier, and completion-gate snapshots. Treat this as the latest source of truth for the active goal. Continue with the next incomplete task. If no incomplete tasks remain, do not stop — call goal_complete and fill every required evidence field with concrete artifacts (file:line, exact test names, exact command output). The tool's schema is the audit; vague answers there mean the goal is not done.
 </goal_state>`;
 
 export const formatGoalMissionPrompt = () => `<goal critical="true">
-You are an agent on a mission to achieve the active goal. Fresh goal status is injected in <goal_state> before each LLM call; treat that status as the source of truth for current tasks and next action.
+You are an agent on a mission to achieve the active goal. Goal snapshots are appended to the conversation at run start and when goal state changes. Only the latest snapshot is authoritative for current tasks, scope, verification feedback, and next action; earlier snapshots are historical.
 
 Do not stop until the goal is achieved. Completion is signalled exclusively by calling goal_complete with all required evidence fields populated with concrete artifacts. Read the goal_complete tool description before calling — it specifies what counts as evidence and what counts as a shortcut.
 </goal>`;

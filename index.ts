@@ -1,7 +1,6 @@
 import type {
   ExtensionAPI,
   ExtensionContext,
-  BeforeAgentStartEventResult,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum, Type } from "@earendil-works/pi-ai";
 import fs from "node:fs";
@@ -34,13 +33,11 @@ const GOALS_DIR = path.join(process.env.HOME!, ".pi", "agent", "goals");
 const GOAL_STATUS_UPDATE_INTERVAL_MS = 1000;
 const GOAL_STATE_CUSTOM_TYPE = "goal-state";
 const GOAL_COMPLETION_GATE_CUSTOM_TYPE = "goal-completion-gate";
-const GOAL_SCOPE_CUSTOM_TYPE = "goal-scope";
 const GOAL_STATUS_KEY = "goal";
 // Brief, neutral text that triggers a follow-up turn after agent_end. The
-// actual completion-gate prose is delivered via the `context` handler as a
-// custom-role message (the same channel that reliably ferries goal_state to
-// the LLM across all providers, including cursor-agent which filters
-// synthetic user-message bodies out of the user_query envelope).
+// actual completion-gate prose is persisted as a custom-role message before
+// this trigger is sent. Unlike temporary context injections, persisted messages
+// keep their original position in the transcript and preserve cached prefixes.
 const GOAL_GATE_TRIGGER_TEXT =
   "Reached end of agent run with active goal — running completion gate.";
 // Bright magenta. The theme has no semantic magenta token, so we use a raw
@@ -211,9 +208,10 @@ export default function(pi: ExtensionAPI): void {
   let goalSessionId: string | null = null;
   let goalStatusTimer: ReturnType<typeof setInterval> | null = null;
   let goalContinuationTimer: ReturnType<typeof setTimeout> | null = null;
-  // Set in agent_end, consumed and cleared in the next `context` event.
-  // Drives one-shot injection of the gate prose into the upcoming LLM call.
+  // Set in agent_end / a rejected completion, consumed when publishing or
+  // returning the next persisted snapshot. Never rewrite old messages.
   let pendingGateInjection = false;
+  let lastGoalContextContent: string | undefined;
   // Consecutive gate passes since the last genuine code progress. Reset on
   // setGoal/adoptPersistedGoal and on edit/write tool execution.
   let gatePassCount = 0;
@@ -291,8 +289,9 @@ export default function(pi: ExtensionAPI): void {
   // cancel any pending completion-gate continuation that belongs to the
   // previous goal so it doesn't fire against the replacement.
   const setGoal = async (goalText: string, sessionId: string) => {
-    const nextGoal = await goalManager.createGoal(sessionId, goalText);
     clearGoalContinuationTimer();
+    const nextGoal = await goalManager.createGoal(sessionId, goalText);
+    lastGoalContextContent = undefined;
     pendingGateInjection = false;
     gatePassCount = 0;
     validationCommands = null;
@@ -307,6 +306,7 @@ export default function(pi: ExtensionAPI): void {
   // mutating SQLite (used during session_start / reload / resume).
   const adoptPersistedGoal = (persistedGoal: GoalJson, sessionId: string) => {
     clearGoalContinuationTimer();
+    lastGoalContextContent = undefined;
     pendingGateInjection = false;
     gatePassCount = 0;
     validationCommands = null;
@@ -412,6 +412,50 @@ export default function(pi: ExtensionAPI): void {
     pi.events.emit(GOAL_VERIFIER_CHANNEL, discovery);
     if (!review) verifierBlock = undefined; // Disabled/uninstalled means original behavior.
     return review;
+  };
+
+  // Goal reminders must be part of the stored conversation, not ephemeral
+  // additions in `context`. Moving an earlier reminder to the new tail on each
+  // request breaks the append-only transcript (notably cursor-agent's delta
+  // protocol) even when its text is unchanged. Keep old snapshots immutable;
+  // only the latest snapshot is authoritative.
+  const buildGoalContext = (ctx: ExtensionContext) => {
+    if (!goal) return undefined;
+    getVerifier(ctx); // Disabling/uninstalling the verifier clears stale feedback.
+    const gate = goal.isActive && pendingGateInjection;
+    const sections = goal.isActive ? [
+      formatGoalMissionPrompt(),
+      gate ? formatGoalCompletionGateMessage(goal) : formatGoalState(goal),
+      `<goal_scope critical="true">\n` +
+        `Only modify files within the latest scope. Writes outside it are blocked.\n` +
+        `Allowed: ${goalScope.allow.length ? goalScope.allow.join(", ") : "(any path not denied)"}\n` +
+        `Denied: ${goalScope.deny.length ? goalScope.deny.join(", ") : "(none)"}\n` +
+        `If a change requires an out-of-scope path, update goal_scope first and note it in your completion evidence.\n` +
+        `</goal_scope>`,
+      `<verification_block>\n${verifierBlock?.report ?? "No pending verifier rejection."}\n</verification_block>`,
+    ] : [
+      `<goal_state critical="true">\n` +
+        `No active goal. The previous goal is completed or stopped: ${goal.goal}\n` +
+        `This supersedes earlier goal, task, scope, verifier, and completion-gate instructions. Do not continue the previous goal.\n` +
+        `</goal_state>`,
+    ];
+    return {
+      customType: gate ? GOAL_COMPLETION_GATE_CUSTOM_TYPE : GOAL_STATE_CUSTOM_TYPE,
+      content: sections.join("\n\n"),
+      display: false,
+      // Do not let later task changes mutate historical snapshot details.
+      details: { goal: structuredClone(goal) },
+    };
+  };
+
+  const publishGoalContext = (ctx: ExtensionContext) => {
+    const message = buildGoalContext(ctx);
+    if (!message || (!pendingGateInjection && message.content === lastGoalContextContent)) return;
+    // During tools this is a steering message, drained after the tool batch
+    // and before the next LLM call. When idle it is appended without a turn.
+    pi.sendMessage(message, { deliverAs: "steer", triggerTurn: false });
+    lastGoalContextContent = message.content;
+    pendingGateInjection = false;
   };
 
   const rejectCompletion = (feedback: string, task?: GoalTask) => {
@@ -835,8 +879,9 @@ export default function(pi: ExtensionAPI): void {
   // not a security sandbox. A determined agent can still mutate via bash.
   pi.on("turn_start", () => { rejectedToolBatch = false; });
 
-  pi.on("tool_result", (event) => {
-    if (event.toolName !== "goal_task" && event.toolName !== "goal_complete") return;
+  pi.on("tool_result", (event, ctx) => {
+    if (!["goal_task", "goal_complete", "goal_scope"].includes(event.toolName)) return;
+    publishGoalContext(ctx);
     const details = event.details as { verification?: { pass: boolean } } | undefined;
     if (details?.verification?.pass === false) return { isError: true };
   });
@@ -855,79 +900,24 @@ export default function(pi: ExtensionAPI): void {
     if (decision.blocked) return { block: true, reason: decision.reason };
   });
 
-  pi.on("context", async (event, ctx) => {
-    if (!goal?.isActive) return { messages: event.messages };
-
-    const additions = [
-      {
-        role: "custom" as const,
-        customType: GOAL_STATE_CUSTOM_TYPE,
-        content: formatGoalState(goal),
-        display: false,
-        details: { goal },
-        timestamp: Date.now(),
-      },
-    ];
-
-    if (verifierBlock && getVerifier(ctx)) {
-      additions.push({
-        role: "custom" as const, customType: "goal-verifier-block",
-        content: `<verification_block>\n${verifierBlock.report}\n</verification_block>`,
-        display: false, details: { goal }, timestamp: Date.now(),
-      });
-    }
-
-    // Remind the agent of its active scope every turn so it stays in-bounds.
-    if (goalScope.allow.length || goalScope.deny.length) {
-      additions.push({
-        role: "custom" as const,
-        customType: GOAL_SCOPE_CUSTOM_TYPE,
-        content:
-          `<goal_scope critical="true">\n` +
-          `Only modify files within this scope. Writes outside it are blocked.\n` +
-          `Allowed: ${goalScope.allow.length ? goalScope.allow.join(", ") : "(any path not denied)"}\n` +
-          `Denied: ${goalScope.deny.length ? goalScope.deny.join(", ") : "(none)"}\n` +
-          `If a change genuinely requires touching an out-of-scope path, call goal_scope to update the scope first and note it in your completion evidence.\n` +
-          `</goal_scope>`,
-        display: false,
-        details: { goal },
-        timestamp: Date.now(),
-      });
-    }
-
-    // One-shot gate injection: agent_end set the flag, this turn delivers
-    // the full completion-gate prose and clears the flag. Going through the
-    // context handler (custom-role message) is the only delivery path that
-    // reliably reaches the LLM under all providers — `pi.sendUserMessage`
-    // gets persisted to the session JSONL, but providers like cursor-agent
-    // do not pass synthetic user-message bodies into the model's
-    // user_query envelope, so a sendUserMessage-only delivery is silently
-    // invisible to the model in that environment.
-    if (pendingGateInjection) {
-      pendingGateInjection = false;
-      additions.push({
-        role: "custom" as const,
-        customType: GOAL_COMPLETION_GATE_CUSTOM_TYPE,
-        content: formatGoalCompletionGateMessage(goal),
-        display: false,
-        details: { goal },
-        timestamp: Date.now(),
-      });
-    }
-
-    return { messages: [...event.messages, ...additions] };
+  pi.on("session_compact", (_event, ctx) => {
+    if (!goal?.isActive) return;
+    // Compaction legitimately replaces history. Re-establish current state even
+    // when the automatic retry continues without another before_agent_start.
+    lastGoalContextContent = undefined;
+    publishGoalContext(ctx);
   });
 
-  pi.on("before_agent_start", async (event, _ctx) => {
-    if (goal?.isActive) {
-      return {
-        systemPrompt: `${event.systemPrompt}\n\n${formatGoalMissionPrompt()}`,
-      } as BeforeAgentStartEventResult;
-    }
-
-    return {
-      systemPrompt: event.systemPrompt,
-    } as BeforeAgentStartEventResult;
+  pi.on("before_agent_start", async (_event, ctx) => {
+    if (!goal?.isActive) return;
+    // Pi persists this custom message alongside the prompt. It survives later
+    // tool calls, retries, reloads and provider conversion in its original
+    // position. A fresh run also restores authoritative state after compaction.
+    // Do not override systemPrompt: goal changes belong at the transcript tail.
+    const message = buildGoalContext(ctx)!;
+    lastGoalContextContent = message.content;
+    pendingGateInjection = false;
+    return { message };
   });
 
   pi.on("agent_end", (_event, ctx) => {
@@ -980,6 +970,7 @@ export default function(pi: ExtensionAPI): void {
           "warning",
         );
         pendingGateInjection = false;
+        publishGoalContext(ctx);
         try {
           ctx.abort();
         } catch {
@@ -990,15 +981,12 @@ export default function(pi: ExtensionAPI): void {
 
       // Two-channel delivery, separated for robustness:
       //
-      //   1. The gate *body* is delivered via the `context` handler as a
-      //      custom-role message. Setting pendingGateInjection=true here
-      //      arms the next context call (which fires before the upcoming
-      //      LLM call). This is the only channel that reliably reaches
-      //      the model under cursor-agent: synthetic user-message bodies
-      //      are stripped from cursor-agent's user_query envelope, but
-      //      custom-role context messages flow through unmodified (the
-      //      goal_state injection uses the same channel and is observably
-      //      delivered every turn).
+      //   1. Persist the gate as a custom message before triggering a turn.
+      //      If Pi is busy it is queued as steering, ahead of the follow-up.
+      //      This also covers queued continuations that do not fire another
+      //      before_agent_start. Custom messages reach cursor-agent even
+      //      when synthetic user-message bodies are stripped. Persistence
+      //      keeps the gate in its original transcript position thereafter.
       //
       //   2. A short, neutral trigger text is sent via sendUserMessage so
       //      the agent actually *takes another turn*. The body of this
@@ -1011,18 +999,18 @@ export default function(pi: ExtensionAPI): void {
       //      processing..." inside an async fn and bindCore's
       //      .catch(emitError) wrapper silently swallows it.
       //
-      // Together: arm the body, then trigger the turn. The synchronous
+      // Together: persist the body, then trigger the turn. The synchronous
       // try/catch only intercepts assertActive() throws on a stale
       // runtime; async sendUserMessage failures are not catchable here
       // by design (see bindCore in pi-coding-agent's loader.js).
       pendingGateInjection = true;
       try {
+        publishGoalContext(ctx);
         pi.sendUserMessage(GOAL_GATE_TRIGGER_TEXT, {
           deliverAs: "followUp",
         });
       } catch {
-        // Stale runtime — context handler may not run, so unset the flag
-        // so we don't inject a stale gate against a future session.
+        // Stale runtime — do not carry a pending gate into a future session.
         pendingGateInjection = false;
       }
     }, 0);

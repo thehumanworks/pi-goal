@@ -45,7 +45,7 @@ evidence-backed completion.
   tool (todo list), and lifecycle hooks.
 - `goalManager.ts` — SQLite persistence (`~/.pi/agent/goals/goals.sqlite`),
   keyed by session id, with a serialized async operation queue.
-- `prompts.ts` — the `<goal_state>` reminder, mission system prompt, and
+- `prompts.ts` — the `<goal_state>` snapshot, mission prose, and
   completion-gate prose. Kept slim on purpose: the `goal_complete` schema is the
   audit, not an inlined checklist.
 - `formatters.ts` — goal-text normalization, elapsed-duration formatting.
@@ -72,20 +72,33 @@ evidence-backed completion.
   `{block, reason}`. deny takes precedence; a non-empty `allow` makes anything
   outside it out-of-scope. Paths are made cwd-relative and normalized (so `../`
   traversal can't slip past an allowlist). Reads/searches are never gated.
-- A `<goal_scope>` reminder is injected into context each turn while a scope is
-  set. **Limitation:** bash-based writes (`echo >`, `tee`, `sed -i`) are NOT
+- The latest persisted goal snapshot carries `<goal_scope>`, including explicit
+  unrestricted scope after clearing. Earlier snapshots remain historical.
+  **Limitation:** bash-based writes (`echo >`, `tee`, `sed -i`) are NOT
   intercepted — scope is a drift guardrail, not a security sandbox.
 
 ## Loop mechanics (how the goal keeps the agent working)
-1. `before_agent_start` appends the mission prompt to the system prompt.
-2. `context` (fires before each LLM call) injects a `<goal_state>` custom-role
-   message — the live source of truth for tasks / next action. This is the only
-   delivery channel that reliably reaches the model across all providers
-   (cursor-agent strips synthetic user-message bodies from its envelope).
-3. `agent_end` arms a one-shot completion gate: a neutral trigger message
-   (`sendUserMessage(..., {deliverAs: "followUp"})`) forces another turn, and the
-   next `context` injection carries the gate prose. The agent must either keep
-   working or call `goal_complete` with every evidence field populated.
+1. `before_agent_start` returns a custom goal snapshot that Pi persists in the
+   conversation. Mission, task state, scope and verifier feedback live together
+   at the tail; the extension never overrides the system prompt.
+2. `tool_result` publishes changed goal snapshots with `pi.sendMessage`, using
+   steering delivery so they drain after the tool batch and before the next LLM
+   call. Unchanged lists/no-ops do not publish redundant snapshots. Only the
+   latest snapshot is authoritative; older messages are never moved or removed.
+3. `agent_end` persists a completion-gate snapshot before sending a neutral
+   `sendUserMessage(..., {deliverAs: "followUp"})` trigger. This works even when
+   a busy runtime queues the continuation without another `before_agent_start`.
+   The custom message reaches cursor-agent even when synthetic user text does
+   not. The agent must keep working or call `goal_complete` with evidence.
+4. `session_compact` restores the authoritative snapshot after history is
+   compacted, including automatic retries without another run-start event.
+
+**Cache invariant:** do not reintroduce temporary goal messages in `context` or
+rewrite the system prompt for active/inactive goals. Each normal request must
+preserve the preceding provider-visible transcript as an exact prefix. Moving
+an ephemeral reminder from before the previous assistant response to after its
+new tool results breaks that invariant and can cause a full cache rebase.
+Regression tests and limitations: `docs/CACHE.md`.
 
 ## Useful extension API surface (from @earendil-works/pi-coding-agent)
 - Events can **block** (`tool_call` → `{block, reason}`) and **modify**

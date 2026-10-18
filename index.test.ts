@@ -2,7 +2,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { convertToLlm, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ReviewCompletion } from "./verification.ts";
 import {
   createGoalManager,
   GOALS_DB_FILENAME,
@@ -37,6 +38,11 @@ type TestHarness = {
   handlers: Map<string, Function>;
   tools: Map<string, RegisteredTool>;
   sentUserMessages: Array<{ text: string; options?: unknown }>;
+  sentMessages: Array<{ message: any; options?: unknown }>;
+  messages: any[];
+  startRun(text?: string): Promise<any>;
+  modelContext(): Promise<any[]>;
+  setVerifier(review?: ReviewCompletion): void;
   execCalls: Array<{ command: string; args: string[]; options?: unknown }>;
   thinkingLevels: string[];
   abortCount: number;
@@ -77,6 +83,11 @@ const createHarness = async (
   const tools = new Map<string, RegisteredTool>();
   const flags = new Map<string, unknown>();
   const sentUserMessages: Array<{ text: string; options?: unknown }> = [];
+  const sentMessages: Array<{ message: any; options?: unknown }> = [];
+  const messages: any[] = [];
+  const queuedMessages: any[] = [];
+  let executingTool = false;
+  let review: ReviewCompletion | undefined;
   const execCalls: Array<{
     command: string;
     args: string[];
@@ -85,7 +96,10 @@ const createHarness = async (
   const thinkingLevels: string[] = [];
 
   const pi = {
-    events: { emit() {}, on() { return () => {}; } },
+    events: {
+      emit(_channel: string, discovery: any) { if (review) discovery.provide(review); },
+      on() { return () => {}; },
+    },
     registerFlag(name: string) {
       flags.set(name, undefined);
     },
@@ -106,6 +120,13 @@ const createHarness = async (
         opts.sendUserMessage(text, options);
       }
       sentUserMessages.push({ text, options });
+    },
+    sendMessage(message: any, options?: unknown) {
+      const snapshot = structuredClone({ role: "custom", ...message, timestamp: Date.now() });
+      sentMessages.push({ message: snapshot, options });
+      // Mirror Pi: tool-issued steering messages drain after tool results,
+      // before the next LLM call. Idle messages append without starting a run.
+      (executingTool ? queuedMessages : messages).push(snapshot);
     },
     async exec(command: string, args: string[], options?: unknown) {
       execCalls.push({ command, args, options });
@@ -132,6 +153,7 @@ const createHarness = async (
     },
     sessionManager: {
       getSessionId: () => "test-session",
+      getBranch: () => messages.map((message) => ({ type: "message", message })),
     },
     ui: {
       notify() {},
@@ -151,13 +173,33 @@ const createHarness = async (
   ) => {
     const tool = tools.get(name);
     if (!tool) throw new Error(`Tool not registered: ${name}`);
-    return await tool.execute(
-      "test-tool-call",
-      params,
-      new AbortController().signal,
-      () => {},
-      ctx,
-    );
+    const toolCallId = `test-tool-call-${messages.length}`;
+    messages.push({ role: "assistant", content: [{ type: "toolCall", id: toolCallId, name, arguments: params }], timestamp: Date.now() });
+    executingTool = true;
+    try {
+      let result = await tool.execute(
+        toolCallId, params, new AbortController().signal, () => {}, ctx,
+      );
+      const override = await handlers.get("tool_result")?.({
+        type: "tool_result", toolName: name, toolCallId, input: params,
+        ...result, isError: false,
+      }, ctx);
+      result = { ...result, ...override };
+      messages.push(structuredClone({ role: "toolResult", toolCallId, toolName: name, ...result, timestamp: Date.now() }));
+      return result;
+    } finally {
+      executingTool = false;
+      messages.push(...queuedMessages.splice(0));
+    }
+  };
+
+  const startRun = async (text = "hi") => {
+    messages.push({ role: "user", content: [{ type: "text", text }], timestamp: Date.now() });
+    const result = await handlers.get("before_agent_start")?.({ systemPrompt: "base prompt", messageType: "user", prompt: text }, ctx);
+    if (result?.message) {
+      messages.push(structuredClone({ role: "custom", ...result.message, timestamp: Date.now() }));
+    }
+    return result;
   };
 
   cleanupCallbacks.push(async () => {
@@ -170,6 +212,14 @@ const createHarness = async (
     handlers,
     tools,
     sentUserMessages,
+    sentMessages,
+    messages,
+    startRun,
+    modelContext: async () => {
+      const result = await handlers.get("context")?.({ messages: structuredClone(messages) }, ctx);
+      return structuredClone(convertToLlm(result?.messages ?? messages));
+    },
+    setVerifier(candidate) { review = candidate; },
     execCalls,
     thinkingLevels,
     get abortCount() {
@@ -375,7 +425,7 @@ describe("goal lifecycle integration", () => {
     ]);
   });
 
-  test("after agent_end, sends a turn-trigger via sendUserMessage and arms the next context call to inject the gate", async () => {
+  test("after agent_end, persists the gate before queuing a followUp trigger", async () => {
     const harness = await createHarness();
     await harness.commands.get("goal")!.handler("Keep going", harness.ctx);
     await harness.executeTool("goal_task", { action: "add", text: "Verify work" });
@@ -391,7 +441,7 @@ describe("goal lifecycle integration", () => {
     // The deferred sendUserMessage carries only the brief trigger text,
     // not the gate prose. The trigger's only job is to leave the idle
     // state so the next LLM turn fires; the actual gate body is delivered
-    // via the `context` handler (the only channel that reliably reaches
+    // via a persisted custom message (the channel that reliably reaches
     // the LLM under cursor-agent, which strips synthetic user-message
     // bodies from the user_query envelope).
     expect(harness.sentUserMessages).toHaveLength(2);
@@ -407,19 +457,11 @@ describe("goal lifecycle integration", () => {
     // already processing" and the runtime silently swallows that rejection.
     expect(triggerDelivery.options).toEqual({ deliverAs: "followUp" });
 
-    // The next context call (the one that fires before the upcoming LLM
-    // turn that the trigger above caused) must include the full gate
-    // prose as a custom-role message in addition to the usual goal_state.
-    const armed = await harness.handlers.get("context")!(
-      { messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }] },
-      harness.ctx,
-    );
-    expect(armed.messages).toHaveLength(3);
-    const goalState = armed.messages[1];
-    expect(goalState.role).toBe("custom");
-    expect(goalState.customType).toBe("goal-state");
-    const gate = armed.messages[2];
-    expect(gate.role).toBe("custom");
+    // The gate is persisted before the trigger, including when Pi is busy
+    // and a queued continuation will not fire before_agent_start again.
+    const gate = harness.sentMessages.at(-1)!.message;
+    expect(harness.sentMessages.at(-1)!.options).toEqual({ deliverAs: "steer", triggerTurn: false });
+    expect(harness.messages.at(-1).role).toBe("custom");
     expect(gate.customType).toBe("goal-completion-gate");
     expect(gate.display).toBe(false);
     expect(gate.content).toContain("GOAL COMPLETION GATE");
@@ -437,41 +479,31 @@ describe("goal lifecycle integration", () => {
     expect(gate.content).toContain("Do exactly one of");
     expect(gate.content).toContain("evidence field");
 
-    // The gate is one-shot: subsequent context calls before the next
-    // agent_end must NOT re-inject the gate (otherwise every LLM call
-    // mid-turn would balloon with the full audit checklist).
-    const followup = await harness.handlers.get("context")!(
-      { messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }] },
-      harness.ctx,
-    );
-    expect(followup.messages).toHaveLength(2);
-    expect(followup.messages[1].customType).toBe("goal-state");
+    // The gate remains in history, at its original position. A later run
+    // without another agent_end gets state only, not another copy of the gate.
+    const prefix = await harness.modelContext();
+    const followup = await harness.startRun();
+    expect(followup.message.customType).toBe("goal-state");
+    expect((await harness.modelContext()).slice(0, prefix.length)).toEqual(prefix);
   });
 
   test("re-arms the gate on every agent_end so a multi-turn back-and-forth keeps prompting completion audits", async () => {
     const harness = await createHarness();
     await harness.commands.get("goal")!.handler("Repeat audits", harness.ctx);
 
-    // First agent_end → gate is delivered on the next context call.
+    // Each agent_end persists one new gate, even without another run start.
     harness.handlers.get("agent_end")!({ messages: [] }, harness.ctx);
     await waitForDeferredCallbacks();
-    let result = await harness.handlers.get("context")!(
-      { messages: [] },
-      harness.ctx,
-    );
-    expect(result.messages).toHaveLength(2);
-    expect(result.messages[1].customType).toBe("goal-completion-gate");
+    const firstGate = harness.sentMessages.at(-1)!.message;
+    expect(firstGate.customType).toBe("goal-completion-gate");
+    const count = harness.sentMessages.length;
 
     // Second agent_end (e.g., LLM ended again without calling goal_complete)
-    // must re-arm the flag so the next context call also injects the gate.
+    // must persist another gate even when its content is unchanged.
     harness.handlers.get("agent_end")!({ messages: [] }, harness.ctx);
     await waitForDeferredCallbacks();
-    result = await harness.handlers.get("context")!(
-      { messages: [] },
-      harness.ctx,
-    );
-    expect(result.messages).toHaveLength(2);
-    expect(result.messages[1].customType).toBe("goal-completion-gate");
+    expect(harness.sentMessages).toHaveLength(count + 1);
+    expect(harness.sentMessages.at(-1)!.message.customType).toBe("goal-completion-gate");
   });
 
   test("queues the trigger as followUp even when a steered user message lands between agent_end and the deferred timer", async () => {
@@ -495,7 +527,7 @@ describe("goal lifecycle integration", () => {
 
     // The trigger must still be delivered as followUp so pi queues it
     // rather than rejecting it, and the gate body must still arrive on
-    // the next context call.
+    // the next run.
     expect(harness.sentUserMessages).toHaveLength(3);
     const triggerDelivery = harness.sentUserMessages[2]!;
     expect(triggerDelivery.text).toBe(
@@ -503,13 +535,9 @@ describe("goal lifecycle integration", () => {
     );
     expect(triggerDelivery.options).toEqual({ deliverAs: "followUp" });
 
-    const armed = await harness.handlers.get("context")!(
-      { messages: [] },
-      harness.ctx,
-    );
-    expect(armed.messages).toHaveLength(2);
-    expect(armed.messages[1].customType).toBe("goal-completion-gate");
-    expect(armed.messages[1].content).toContain("GOAL COMPLETION GATE");
+    const gate = harness.sentMessages.at(-1)!.message;
+    expect(gate.customType).toBe("goal-completion-gate");
+    expect(gate.content).toContain("GOAL COMPLETION GATE");
   });
 
   test("clears the pending gate when the goal is completed before the next LLM call", async () => {
@@ -519,19 +547,16 @@ describe("goal lifecycle integration", () => {
     harness.handlers.get("agent_end")!({ messages: [] }, harness.ctx);
     await waitForDeferredCallbacks();
 
-    // Goal completes after the trigger fired but before the context handler
-    // runs. The next context call must NOT inject a stale gate.
+    // Goal completes after the trigger fired but before the next run.
+    // The next run must NOT persist a stale gate.
     await harness.executeTool("goal_complete", {
       summary: "Done before the gate could inject.",
     });
 
-    const result = await harness.handlers.get("context")!(
-      { messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }] },
-      harness.ctx,
-    );
-
-    // No goal-state, no gate — the goal is no longer active.
-    expect(result.messages).toHaveLength(1);
+    const result = await harness.startRun();
+    // No new snapshot or gate — the completion snapshot is already persisted.
+    expect(result).toBeUndefined();
+    expect(harness.sentMessages.at(-1)!.message.content).toContain("No active goal");
   });
 
   test("does not send a deferred continuation reminder after the goal is completed", async () => {
@@ -751,43 +776,34 @@ describe("goal and task tracking tools", () => {
 });
 
 describe("goal prompt integration", () => {
-  test("injects a stable goal mission into the system prompt that points at the goal_complete tool's schema as the audit (no inlined procedural checklist)", async () => {
+  test("persists the goal mission as a custom message without overriding the system prompt", async () => {
     const harness = await createHarness();
     await harness.commands.get("goal")!.handler("Prompt goal", harness.ctx);
 
-    const result = await harness.handlers.get("before_agent_start")!(
-      { systemPrompt: "base prompt\n" },
-      harness.ctx,
-    );
-
-    expect(result.systemPrompt).toContain("base prompt");
-    expect(result.systemPrompt).toContain("<goal critical=\"true\">");
-    expect(result.systemPrompt).toContain("Fresh goal status is injected in <goal_state>");
+    const result = await harness.startRun();
+    expect(result.systemPrompt).toBeUndefined();
+    expect(result.message.content).toContain("<goal critical=\"true\">");
+    expect(result.message.content).toContain("Only the latest snapshot is authoritative");
     // The mission routes the agent to the tool, not to a free-text checklist.
-    expect(result.systemPrompt).toContain("goal_complete");
-    expect(result.systemPrompt).toContain("evidence fields populated");
-    expect(result.systemPrompt).toContain("concrete artifacts");
-    // Procedural / response-text-matching artifacts must not be inlined.
-    expect(result.systemPrompt).not.toContain("Completion audit checklist");
-    expect(result.systemPrompt).not.toContain("A. Scope and requirements");
-    expect(result.systemPrompt).not.toContain("Did you run linter and formatter");
+    expect(result.message.content).toContain("goal_complete");
+    expect(result.message.content).toContain("evidence fields populated");
+    expect(result.message.content).toContain("concrete artifacts");
+    expect(result.message.content).not.toContain("Completion audit checklist");
+    expect(result.message.content).not.toContain("A. Scope and requirements");
+    expect(result.message.content).not.toContain("Did you run linter and formatter");
+    expect(harness.handlers.has("context")).toBe(false);
   });
 
-  test("injects lightweight current goal state into context before each LLM call", async () => {
+  test("persists current task state at run start and after changes", async () => {
     const harness = await createHarness();
     await harness.commands.get("goal")!.handler("Prompt goal", harness.ctx);
     await harness.executeTool("goal_task", { action: "add", text: "Prompt task" });
     await harness.executeTool("goal_task", { action: "check", id: 1 });
     await harness.executeTool("goal_task", { action: "add", text: "Next task" });
 
-    const result = await harness.handlers.get("context")!(
-      { messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }] },
-      harness.ctx,
-    );
-
-    expect(result.messages).toHaveLength(2);
-    const goalState = result.messages[1];
-    expect(goalState.role).toBe("custom");
+    const result = await harness.startRun();
+    const goalState = result.message;
+    expect(harness.messages.at(-1).role).toBe("custom");
     expect(goalState.customType).toBe("goal-state");
     expect(goalState.display).toBe(false);
     expect(goalState.content).toContain("<goal_state critical=\"true\">");
@@ -802,6 +818,176 @@ describe("goal prompt integration", () => {
     expect(goalState.content).toContain("concrete artifacts");
     expect(goalState.content).not.toContain("Completion audit checklist");
     expect(goalState.content).not.toContain("Did you run linter and formatter");
+  });
+});
+
+describe("append-only goal context (prompt-cache regression)", () => {
+  test("preserves the provider-visible prefix across consecutive ordinary tool calls", async () => {
+    const harness = await createHarness();
+    await harness.commands.get("goal")!.handler("Keep the cached prefix", harness.ctx);
+    await harness.startRun();
+    const initialSnapshot = structuredClone(harness.messages.at(-1));
+    let previous = await harness.modelContext();
+
+    for (const [index, toolName] of ["write", "read", "edit"].entries()) {
+      const id = `ordinary-tool-${index}`;
+      harness.messages.push(
+        { role: "assistant", content: [{ type: "toolCall", id, name: toolName, arguments: { path: "docs/CLEANUP.md" } }], timestamp: index },
+        { role: "toolResult", toolCallId: id, toolName, content: [{ type: "text", text: "OK" }], isError: false, timestamp: index },
+      );
+      const next = await harness.modelContext();
+      expect(next.slice(0, previous.length)).toEqual(previous);
+      expect(await harness.modelContext()).toEqual(next); // retries/idle cache warming
+      previous = next;
+    }
+    expect(harness.messages[1]).toEqual(initialSnapshot);
+    expect(harness.messages.filter((m) => m.role === "custom")).toHaveLength(1);
+    expect(harness.sentMessages).toHaveLength(0);
+  });
+
+  test("appends task and scope changes without moving or mutating earlier snapshots", async () => {
+    const harness = await createHarness();
+    await harness.commands.get("goal")!.handler("Document cleanup", harness.ctx);
+    await harness.startRun();
+    const initial = structuredClone(harness.messages[1]);
+    const actions: Array<[string, Record<string, unknown>, string]> = [
+      ["goal_task", { action: "add", text: "Record boundary" }, "- [ ] #1: Record boundary"],
+      ["goal_task", { action: "check", id: 1 }, "- [x] #1: Record boundary"],
+      ["goal_task", { action: "uncheck", id: 1 }, "- [ ] #1: Record boundary"],
+      ["goal_scope", { action: "set", allow: ["docs/**"], deny: ["docs/private/**"] }, "Denied: docs/private/**"],
+      ["goal_scope", { action: "clear" }, "Denied: (none)"],
+    ];
+    for (const [tool, params, expected] of actions) {
+      const prefix = await harness.modelContext();
+      await harness.executeTool(tool, params);
+      expect((await harness.modelContext()).slice(0, prefix.length)).toEqual(prefix);
+      expect(harness.messages.at(-1).role).toBe("custom");
+      expect(harness.messages.at(-1).content).toContain(expected);
+    }
+    expect(harness.messages[1]).toEqual(initial);
+    expect(initial.details.goal.tasks).toEqual([]);
+  });
+
+  test("does not republish unchanged state for task/scope lists, no-ops or validation errors", async () => {
+    const harness = await createHarness();
+    await harness.commands.get("goal")!.handler("Avoid redundant reminders", harness.ctx);
+    await harness.startRun();
+    for (const [tool, params] of [
+      ["goal_task", { action: "list" }],
+      ["goal_scope", { action: "list" }],
+      ["goal_scope", { action: "clear" }],
+      ["goal_task", { action: "check", id: 99 }],
+      ["goal_task", { action: "add" }],
+    ] as const) await harness.executeTool(tool, params);
+    expect(harness.sentMessages).toHaveLength(0);
+  });
+
+  test("retains the gate prefix through task progress and subsequent user runs", async () => {
+    const harness = await createHarness();
+    await harness.commands.get("goal")!.handler("Continue safely", harness.ctx);
+    await harness.startRun();
+    const initial = await harness.modelContext();
+    harness.handlers.get("agent_end")!({}, harness.ctx);
+    await waitForDeferredCallbacks();
+    const gated = await harness.modelContext();
+    expect(gated.slice(0, initial.length)).toEqual(initial);
+    expect(harness.messages.at(-1).customType).toBe("goal-completion-gate");
+    await harness.executeTool("goal_task", { action: "add", text: "Keep working" });
+    const progressed = await harness.modelContext();
+    expect(progressed.slice(0, gated.length)).toEqual(gated);
+    await harness.startRun("Another user message");
+    expect((await harness.modelContext()).slice(0, progressed.length)).toEqual(progressed);
+    expect(harness.messages.at(-1).content).toContain("Keep working");
+  });
+
+  test("supersedes completion and goal replacement at the tail without rewriting history", async () => {
+    const harness = await createHarness();
+    await harness.commands.get("goal")!.handler("Original", harness.ctx);
+    await harness.startRun();
+    const active = await harness.modelContext();
+    await harness.executeTool("goal_complete", { summary: "Finished" });
+    expect((await harness.modelContext()).slice(0, active.length)).toEqual(active);
+    expect(harness.messages.at(-1).content).toContain("No active goal");
+    expect(await harness.startRun()).toBeUndefined();
+    const completed = await harness.modelContext();
+    await harness.commands.get("goal")!.handler("Replacement", harness.ctx);
+    const result = await harness.startRun();
+    expect(result.systemPrompt).toBeUndefined();
+    expect(result.message.content).toContain("Current goal: Replacement");
+    expect((await harness.modelContext()).slice(0, completed.length)).toEqual(completed);
+  });
+
+  test("keeps verifier rejection sticky and appends its resolution instead of removing feedback", async () => {
+    const harness = await createHarness();
+    await harness.commands.get("goal")!.handler("Review evidence", harness.ctx);
+    await harness.startRun();
+    await harness.executeTool("goal_task", { action: "add", text: "Verify cleanup" });
+    harness.setVerifier(async () => ({ pass: false, feedback: "Missing cleanup test" }));
+    const prefix = await harness.modelContext();
+    const rejection = await harness.executeTool("goal_task", { action: "check", id: 1 });
+    expect(rejection.isError).toBe(true);
+    expect((await expectSavedGoal(harness.home)).tasks[0]!.isComplete).toBe(false);
+    expect(harness.messages.at(-1).content).toContain("Missing cleanup test");
+    expect((await harness.modelContext()).slice(0, prefix.length)).toEqual(prefix);
+    await harness.executeTool("goal_task", { action: "list" });
+    expect(harness.messages.at(-1).content).toContain("Missing cleanup test");
+    const rejected = await harness.modelContext();
+    harness.setVerifier(async () => ({ pass: true, feedback: "Cleanup test verified" }));
+    await harness.executeTool("goal_task", { action: "check", id: 1 });
+    expect(harness.messages.at(-1).content).toContain("No pending verifier rejection");
+    expect(harness.messages.at(-1).content).not.toContain("Missing cleanup test");
+    expect((await harness.modelContext()).slice(0, rejected.length)).toEqual(rejected);
+  });
+
+  test("appends explicit feedback clearing when the verifier is disabled", async () => {
+    const harness = await createHarness();
+    await harness.commands.get("goal")!.handler("Optional review", harness.ctx);
+    await harness.startRun();
+    await harness.executeTool("goal_task", { action: "add", text: "Review" });
+    harness.setVerifier(async () => ({ pass: false, feedback: "Needs more evidence" }));
+    await harness.executeTool("goal_task", { action: "check", id: 1 });
+    const prefix = await harness.modelContext();
+    harness.setVerifier(undefined);
+    await harness.executeTool("goal_task", { action: "list" });
+    expect(harness.messages.at(-1).content).toContain("No pending verifier rejection");
+    expect((await harness.modelContext()).slice(0, prefix.length)).toEqual(prefix);
+  });
+
+  test("keeps exec-gate failures and successful retry append-only", async () => {
+    let fail = true;
+    const harness = await createHarness(undefined, {
+      exec: () => ({ code: fail ? 1 : 0, stdout: fail ? "cleanup test failed" : "passed", stderr: "", killed: false }),
+    });
+    fs.writeFileSync(path.join(harness.home, ".pi-goal.json"), JSON.stringify({ validate: ["bun test"] }));
+    await harness.commands.get("goal")!.handler("Verified completion", harness.ctx);
+    await harness.startRun();
+    const initial = await harness.modelContext();
+    const failure = await harness.executeTool("goal_complete", { summary: "Premature" });
+    expect(failure.content[0].text).toContain("cleanup test failed");
+    expect(harness.messages.at(-1).customType).toBe("goal-completion-gate");
+    expect((await harness.modelContext()).slice(0, initial.length)).toEqual(initial);
+    const blocked = await harness.modelContext();
+    fail = false;
+    await harness.executeTool("goal_complete", { summary: "Now verified" });
+    expect(harness.messages.at(-1).content).toContain("No active goal");
+    expect((await harness.modelContext()).slice(0, blocked.length)).toEqual(blocked);
+  });
+
+  test("restores authoritative state after compaction even without another run start", async () => {
+    const harness = await createHarness();
+    await harness.commands.get("goal")!.handler("Survive compaction", harness.ctx);
+    await harness.startRun();
+    await harness.executeTool("goal_task", { action: "add", text: "Still open" });
+    await harness.executeTool("goal_scope", { action: "set", allow: ["src/**"] });
+    harness.messages.splice(0, harness.messages.length, {
+      role: "compactionSummary", summary: "Earlier work", tokensBefore: 90000, timestamp: 1,
+    });
+    harness.handlers.get("session_compact")!({}, harness.ctx);
+    expect(harness.messages.at(-1).content).toContain("- [ ] #1: Still open");
+    expect(harness.messages.at(-1).content).toContain("Allowed: src/**");
+    const compacted = await harness.modelContext();
+    await harness.executeTool("goal_task", { action: "check", id: 1 });
+    expect((await harness.modelContext()).slice(0, compacted.length)).toEqual(compacted);
   });
 });
 
@@ -823,12 +1009,14 @@ describe("goal restoration on session_start", () => {
     const list = await second.executeTool("goal_task", { action: "list" });
     expect(list.content[0].text).toBe("[ ] #1: Resume task");
 
-    // The mission prompt is injected because the rehydrated goal is active.
+    // The persisted snapshot restores the mission without replacing the system.
     const promptResult = await second.handlers.get("before_agent_start")!(
       { systemPrompt: "base" },
       second.ctx,
     );
-    expect(promptResult.systemPrompt).toContain("<goal critical=\"true\">");
+    expect(promptResult.systemPrompt).toBeUndefined();
+    expect(promptResult.message.content).toContain("<goal critical=\"true\">");
+    expect(promptResult.message.content).toContain("Resume task");
 
     // No automatic re-send of the goal text on restore.
     expect(second.sentUserMessages).toEqual([]);
@@ -851,7 +1039,7 @@ describe("goal restoration on session_start", () => {
       { systemPrompt: "base" },
       second.ctx,
     );
-    expect(promptResult.systemPrompt).toBe("base");
+    expect(promptResult).toBeUndefined();
 
     // No deferred completion-gate fires for completed goals.
     second.handlers.get("agent_end")!({ messages: [] }, second.ctx);
@@ -972,6 +1160,8 @@ describe("gate-pass circuit breaker", () => {
     expect(persisted.isActive).toBe(false);
     expect(persisted.completionSummary).toContain("hard-stopped");
     expect(harness.abortCount).toBe(1);
+    expect(harness.sentMessages.at(-1)!.message.content).toContain("No active goal");
+    expect(harness.sentMessages.at(-1)!.message.details.goal.isActive).toBe(false);
   });
 
   test("resets the pass counter on edit/write tool execution so productive work is never hard-stopped", async () => {
@@ -1173,24 +1363,18 @@ describe("scope enforcement", () => {
     expect(harness.handlers.get("tool_call")!(writeCall("anything.ts"), harness.ctx)).toBeUndefined();
   });
 
-  test("injects a <goal_scope> reminder into context only while a scope is set", async () => {
+  test("appends the current scope and explicit clearing to persistent goal snapshots", async () => {
     const harness = await createHarness();
     await harness.commands.get("goal")!.handler("Scoped goal", harness.ctx);
 
-    const before = await harness.handlers.get("context")!(
-      { messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }] },
-      harness.ctx,
-    );
-    expect(before.messages.some((m: any) => m.customType === "goal-scope")).toBe(false);
-
+    const before = await harness.startRun();
+    expect(before.message.content).toContain("Allowed: (any path not denied)");
+    const prefix = await harness.modelContext();
     await harness.executeTool("goal_scope", { action: "set", allow: ["pkg/**"] });
-    const after = await harness.handlers.get("context")!(
-      { messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }] },
-      harness.ctx,
-    );
-    const scopeMsg = after.messages.find((m: any) => m.customType === "goal-scope");
-    expect(scopeMsg).toBeDefined();
-    expect(scopeMsg.content).toContain("pkg/**");
+    expect(harness.sentMessages.at(-1)!.message.content).toContain("Allowed: pkg/**");
+    await harness.executeTool("goal_scope", { action: "clear" });
+    expect(harness.sentMessages.at(-1)!.message.content).toContain("Allowed: (any path not denied)");
+    expect((await harness.modelContext()).slice(0, prefix.length)).toEqual(prefix);
   });
 
   test("goal_scope clear removes constraints and replacing the goal resets scope", async () => {
